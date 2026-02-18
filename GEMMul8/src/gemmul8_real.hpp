@@ -207,9 +207,9 @@ __inline__ std::vector<double> gemm(
         // Accumulation and Inverse scaling
         // C64f = sum(qi*Pi*C8i[i]),
         //  where
-        //      Pi := P/p[i],
-        //      P  := prod(p[all]),
-        //      mod(qi*Pi, p[i]) \equiv 1.
+        //      Pi := P/p[i], --> Mi
+        //      P  := prod(p[all]), --> M
+        //      mod(qi*Pi, p[i]) \equiv 1. --> Miyi = 1 (mod m_i)
         // C := C64f - round(C64f/P)*P
         // C := diag(2^sftA) * C * diag(2^sftB)
         //------------------------------

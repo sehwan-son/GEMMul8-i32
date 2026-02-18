@@ -53,8 +53,11 @@ ifeq ($(GPU_ARCH),auto)
 GPU_ARCH := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1 | tr -d '.')
 endif
 
-# get memory size
-GPU_MEM_MB := $(shell nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+# get memory size (fallback to 0 when NVML query is unavailable)
+GPU_MEM_MB := $(shell nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -dc '0-9')
+ifeq ($(GPU_MEM_MB),)
+GPU_MEM_MB := 0
+endif
 
 # path
 export PATH := $(CUDA_PATH)/bin:$(PATH)
@@ -139,8 +142,15 @@ TARGET_d := test_double
 TARGET_f := test_float
 TARGET_z := test_double_complex
 TARGET_c := test_float_complex
+TARGET_i := test_int32
+TARGET_ib := test_int32_bench
 
-all: INFO $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c) VERSION
+TARGETS := $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c)
+ifeq ($(BACKEND),cuda)
+TARGETS += $(TARGET_i) $(TARGET_ib)
+endif
+
+all: INFO $(TARGETS) VERSION
 
 INFO:
 	$(info BACKEND      : $(BACKEND))
@@ -171,6 +181,14 @@ $(TARGET_z): $(TARGET_z).cu
 $(TARGET_c): $(TARGET_c).cu
 	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
 
+ifeq ($(BACKEND),cuda)
+$(TARGET_i): $(TARGET_i).cu
+	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
+
+$(TARGET_ib): $(TARGET_ib).cu
+	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
+endif
+
 VERSION:
 	$(COMPILER) --version 2>&1 | tee $(COMPILER)_version
 
@@ -186,6 +204,14 @@ test_z:
 test_c:
 	LD_PRELOAD=$(LD) ./$(TARGET_c) $(MODE)
 
+ifeq ($(BACKEND),cuda)
+test_i32:
+	LD_PRELOAD=$(LD) ./$(TARGET_i)
+
+bench_i32:
+	LD_PRELOAD=$(LD) ./$(TARGET_ib) $(MODE)
+endif
+
 clean:
 	rm -f *.o
-	rm -f $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c)
+	rm -f $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c) $(TARGET_i) $(TARGET_ib)

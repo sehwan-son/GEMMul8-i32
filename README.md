@@ -118,6 +118,8 @@ Navigate to the `testing` directory and use `make` to run tests for different pr
 | `test_d` | (no)         | Tests for DGEMM                                                 |
 | `test_c` | (no)         | Tests for CGEMM                                                 |
 | `test_z` | (no)         | Tests for ZGEMM                                                 |
+| `test_i32` | (no)       | Tests for INT32-input GEMM emulation (CUDA backend only).       |
+| `bench_i32` | (no)      | Benchmarks INT32-input path vs cuBLAS INT8 Tensor Core GEMM and writes CSV (CUDA backend only). |
 | `MODE`   | `accuracy`   | Tests numerical accuracy (maximum element-wise relative error). |
 |          | `flops`      | Measures TFLOPS with square matrices.                           |
 |          | `watt`       | Measures watt and GFLOPS/watt with square matrices.             |
@@ -141,6 +143,60 @@ make test_s MODE="all"
 # Run accuracy, flops, & watt tests (SGEMM & DGEMM)
 make test_s test_d MODE="accuracy flops watt"
 ```
+
+```bash
+# Run INT32 correctness test (CUDA)
+make BACKEND=cuda GPU_ARCH=80 test_i32
+```
+
+```bash
+# Run INT32 benchmark (args: <iters> <warmup>)
+make BACKEND=cuda GPU_ARCH=80 bench_i32 MODE="5 2"
+```
+
+```bash
+# Plot benchmark speedup against exact int32*int32->int64 GPU baseline
+# (PNG with matplotlib, or SVG fallback without matplotlib)
+python3 generate_fig/plot_i32_speedup.py i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv --metric speedup_vs_exact_i32_i32_i64 --use-extra true
+```
+
+```bash
+# Plot stage breakdown (encode / tc_gemm / conv32to8 / reconstruct / total)
+# Example: NN, use_extra=true, num_moduli=9, include exact baseline as reference
+python3 generate_fig/plot_i32_speedup.py i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv \
+  --plot-type breakdown --op NN --use-extra true --num-moduli 9 --include-baseline
+```
+
+### INT32 Quick Start (CUDA)
+
+Run from `GEMMul8-i32/GEMMul8/testing`:
+
+```bash
+# 1) Build library/binaries (A100 example: GPU_ARCH=80)
+cd ..
+make -j8 BACKEND=cuda GPU_ARCH=80
+cd testing
+make -j8 BACKEND=cuda GPU_ARCH=80 test_int32 test_int32_bench
+
+# 2) Correctness test
+make BACKEND=cuda GPU_ARCH=80 test_i32
+
+# 3) Benchmark (MODE="<iters> <warmup>")
+make BACKEND=cuda GPU_ARCH=80 bench_i32 MODE="5 2"
+
+# 4) Plot the newest benchmark CSV
+python3 generate_fig/plot_i32_speedup.py "$(ls -1t i32_bench_speedup_*.csv | head -n 1)" --metric speedup_vs_exact_i32_i32_i64 --use-extra true
+```
+
+Notes:
+
+- `GPU_ARCH` examples: `80` (A100), `90` (H100/H200).  
+- The benchmark CSV is saved as `i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv`.
+- `plot_i32_speedup.py` saves PNG if `matplotlib` exists, otherwise it saves SVG.
+- `bench_i32` includes an exact GPU baseline (`int32*int32 -> int64`) implemented as a CUDA kernel (CUDA core path, not Tensor Core).
+- `plot_i32_speedup.py` supports two modes:
+  - `--plot-type single`: plot one selected metric (speedup/ms/GFLOPS).
+  - `--plot-type breakdown`: plot stage-wise GEMMul8 time breakdown.
 
 ## Usage
 
@@ -272,6 +328,63 @@ std::vector<double> gemm(
 
 } // namespace gemmul8
 ```
+
+#### INT32 input path (CUDA only)
+
+GEMMul8 also provides a CUDA-only API for integer input matrices:
+
+- Input: `int32_t` matrices `A`, `B`
+- Internal path: residue encoding -> INT8 Tensor Core GEMM -> CRT reconstruction
+- Output: `int64_t` matrix `C`
+- Compute: `C = alpha*op(A)*op(B) + beta*C`
+
+```cpp
+namespace gemmul8 {
+
+template <bool UseExtraWorkspace = true>
+size_t workSize_i32(
+    const size_t m,
+    const size_t n,
+    const size_t k,
+    const unsigned num_moduli,       // 9 <= num_moduli <= 20
+    size_t *workSizeA = nullptr,
+    size_t *workSizeB = nullptr
+);
+
+template <bool UseExtraWorkspace = true>
+std::vector<double> gemm_i32(
+    cublasHandle_t handle,
+    const cublasOperation_t op_A,
+    const cublasOperation_t op_B,
+    const size_t m,
+    const size_t n,
+    const size_t k,                  // k <= 2^17
+    const int64_t *alpha,
+    const int32_t *const A,
+    const size_t lda,
+    const int32_t *const B,
+    const size_t ldb,
+    const int64_t *beta,
+    int64_t *const C,
+    const size_t ldc,
+    const unsigned num_moduli,       // 9 <= num_moduli <= 20
+    void *const work,
+    void *const workA = nullptr,
+    void *const workB = nullptr
+);
+
+} // namespace gemmul8
+```
+
+Important notes:
+
+- This path currently supports CUDA only. HIP backend is not supported.
+- `alpha` and `beta` are host pointers (`int64_t`) and must be non-null.
+- It computes `C = alpha*op(A)*op(B) + beta*C`.
+- skip/reuse scaling options are not provided.
+- `num_moduli >= 9` is required.
+- For exact `int64_t` reconstruction, the true mathematical result must fit in `int64_t` range (caller responsibility).
+- Hook mode (`hook.cu`) does not use this API.
 
 #### `UseExtraWorkspace` (template parameter)
 
