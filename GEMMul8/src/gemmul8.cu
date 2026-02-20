@@ -42,6 +42,7 @@
 #include "inverse_scaling_real.hpp"
 #include "inverse_scaling_complex.hpp"
 #include "gemmul8_real.hpp"
+#include "gemmul8_complex.hpp"
 #if defined(__NVCC__)
     #include "gemmul8_i32.hpp"
 #endif

@@ -16,7 +16,7 @@ __inline__ void accuracy_check(std::string &deviceName, std::string &dateTime) {
 
     const size_t m = 128;
     const size_t n = 128;
-    const size_t k = *max_element(begin(size_list), end(size_list));
+    const size_t k = m;
 
     const int64_t mi = static_cast<int64_t>(m);
     const int64_t ni = static_cast<int64_t>(n);

@@ -16,6 +16,7 @@ This design enables bit-wise reproducible results while achieving superior perfo
   - [How to Run](#how-to-run)
   - [MODE options](#mode-options)
   - [Example](#example-1)
+- [i32 Benchmark Baseline Policy](#i32-benchmark-baseline-policy)
 - [Usage](#usage)
   - [1. Direct Usage (Normal mode)](#1-direct-usage-normal-mode)
     - [Example: run emulation for the CUDA backend](#example-run-emulation-for-the-cuda-backend)
@@ -135,59 +136,33 @@ make run MODE="SGEMM all"
 make run MODE="SGEMM DGEMM accuracy flops"
 ```
 
+## i32 Benchmark Baseline Policy
+
+For i32 benchmark (`GEMMul8/GEMMul8/testing/test_int32_bench`), the primary baseline is fixed to:
+
+- `exact_i32_i32_i64` (CUDA-core i32×i32 with int64 accumulation)
+
+The int8 cuBLAS baseline is treated as an auxiliary reference and is disabled by default.
+
+- default: auxiliary int8 baseline OFF
+- optional: enable with `--with-int8-baseline`
+
+When auxiliary int8 baseline is OFF, CSV compatibility is preserved:
+
+- existing `cublas_i8_*` and `speedup_vs_cublas_i8_*` columns remain in the CSV header
+- those columns are emitted as empty fields (`""`) per row
+
+Examples (from `GEMMul8/GEMMul8/testing`):
+
 ```bash
-# Run INT32 correctness test (CUDA)
-make BACKEND=cuda GPU_ARCH=80 test_i32
+# Baseline-only run (default)
+./test_int32_bench --iters 5 --warmup 2 --sizes 512,1024,2048,4096 --ops NN
 ```
 
 ```bash
-# Run INT32 benchmark (args: <iters> <warmup>)
-make BACKEND=cuda GPU_ARCH=80 bench_i32 MODE="5 2"
+# Include auxiliary int8 baseline comparisons
+./test_int32_bench --iters 5 --warmup 2 --sizes 512,1024,2048,4096 --ops NN --with-int8-baseline
 ```
-
-```bash
-# Plot benchmark speedup against exact int32*int32->int64 GPU baseline
-# (PNG with matplotlib, or SVG fallback without matplotlib)
-python3 generate_fig/plot_i32_speedup.py i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv --metric speedup_vs_exact_i32_i32_i64 --use-extra true
-```
-
-```bash
-# Plot stage breakdown (encode / tc_gemm / conv32to8 / reconstruct / total)
-# Example: NN, use_extra=true, num_moduli=9, include exact baseline as reference
-python3 generate_fig/plot_i32_speedup.py i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv \
-  --plot-type breakdown --op NN --use-extra true --num-moduli 9 --include-baseline
-```
-
-### INT32 Quick Start (CUDA)
-
-Run from `GEMMul8-i32/GEMMul8/testing`:
-
-```bash
-# 1) Build library/binaries (A100 example: GPU_ARCH=80)
-cd ..
-make -j8 BACKEND=cuda GPU_ARCH=80
-cd testing
-make -j8 BACKEND=cuda GPU_ARCH=80 test_int32 test_int32_bench
-
-# 2) Correctness test
-make BACKEND=cuda GPU_ARCH=80 test_i32
-
-# 3) Benchmark (MODE="<iters> <warmup>")
-make BACKEND=cuda GPU_ARCH=80 bench_i32 MODE="5 2"
-
-# 4) Plot the newest benchmark CSV
-python3 generate_fig/plot_i32_speedup.py "$(ls -1t i32_bench_speedup_*.csv | head -n 1)" --metric speedup_vs_exact_i32_i32_i64 --use-extra true
-```
-
-Notes:
-
-- `GPU_ARCH` examples: `80` (A100), `90` (H100/H200).  
-- The benchmark CSV is saved as `i32_bench_speedup_<DEVICE>_<TIMESTAMP>.csv`.
-- `plot_i32_speedup.py` saves PNG if `matplotlib` exists, otherwise it saves SVG.
-- `bench_i32` includes an exact GPU baseline (`int32*int32 -> int64`) implemented as a CUDA kernel (CUDA core path, not Tensor Core).
-- `plot_i32_speedup.py` supports two modes:
-  - `--plot-type single`: plot one selected metric (speedup/ms/GFLOPS).
-  - `--plot-type breakdown`: plot stage-wise GEMMul8 time breakdown.
 
 ## Usage
 
@@ -206,98 +181,11 @@ See the sample code in `sample/`.
 
 The arguments for `gemmul8::gemm` closely match the standard [cublas&lt;t&gt;gemm](https://docs.nvidia.com/cuda/cublas/#cublas-t-gemm) and [hipblasXgemm](https://rocm.docs.amd.com/projects/hipBLAS/en/develop/reference/hipblas-api-functions.html#hipblasxgemm-batched-stridedbatched) interfaces, with additional parameters that control internal preprocessing and workspace reuse.
 
-GEMMul8 provides both a workspace query function (`workSize`) and an extended GEMM computation interface (`gemm`), as shown below:
+GEMMul8 provides both a workspace query function (`workSize`) and an extended GEMM computation interface (`gemm`).
+See `include/gemmul8.hpp` for the full function signatures:
 
-```cpp
-namespace gemmul8 {
-
-// workSize returns the required workspace size in bytes.
-template <bool is_Complex = false, bool UseExtraWorkspace = true>
-size_t workSize(
-    const size_t m,                         // Number of rows of C
-    const size_t n,                         // Number of columns of C
-    const size_t k,                         // Inner dimension <= 2^17
-    const unsigned num_moduli,              // #moduli, 2 <= num_moduli <= 20
-    const bool enable_skip_scalA = false,   // [option] Reserve extra space for A to allow skip_scalA
-    const bool enable_skip_scalB = false,   // [option] Reserve extra space for B to allow skip_scalB
-    size_t *workSizeA            = nullptr, // [option] Output: workspace size used for A8i and sftA
-    size_t *workSizeB            = nullptr  // [option] Output: workspace size used for B8i and sftB
-);
-
-// gemm returns computation time in second of each computational phase
-#if defined(__NVCC__)
-template <typename T, bool UseExtraWorkspace = true>
-std::vector<double> gemm(
-    cublasHandle_t handle,                  // Handle to the cuBLAS library context
-    const cublasOperation_t op_A,           // CUBLAS_OP_N or CUBLAS_OP_T
-    const cublasOperation_t op_B,           // CUBLAS_OP_N or CUBLAS_OP_T
-    const size_t m,                         // Number of rows of C
-    const size_t n,                         // Number of columns of C
-    const size_t k,                         // Inner dimension <= 2^17
-    const T *alpha,                         // Scaling factor for op(A)*op(B)
-    const T *const A,                       // 1-D device array of dimensions lda*k (CUBLAS_OP_N) or lda*m (CUBLAS_OP_T)
-    const size_t lda,                       // Leading dimension of A
-    const T *const B,                       // 1-D device array of dimensions ldb*n (CUBLAS_OP_N) or ldb*k (CUBLAS_OP_T)
-    const size_t ldb,                       // Leading dimension of B
-    const T *beta,                          // Scaling factor for C
-    T *const C,                             // 1-D device array of dimensions ldc*n
-    const size_t ldc,                       // Leading dimension of C
-    const unsigned num_moduli,              // #moduli, 2 <= num_moduli <= 20
-    const bool fastmode,                    // false (accurate mode) or true (fast mode)
-    void *const work,                       // Preallocated workspace
-    void *const workA            = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
-    void *const workB            = nullptr, // [optional] Separate workspace for B (if nullptr, uses work)
-    const bool enable_skip_scalA = false,   // [optional] Enables scaling-skip mechanism for A
-    const bool enable_skip_scalB = false,   // [optional] Enables scaling-skip mechanism for B
-    const bool skip_scalA        = false,   // [optional] If true, skip preprocessing for A
-    const bool skip_scalB        = false    // [optional] If true, skip preprocessing for B
-);
-#endif
-
-#if defined(__HIPCC__)
-template <typename T, bool UseExtraWorkspace = true>
-std::vector<double> gemm(
-    hipblasHandle_t handle,                 // Handle to the hipBLAS library context
-    const hipblasOperation_t op_A,          // HIPBLAS_OP_N or HIPBLAS_OP_T
-    const hipblasOperation_t op_B,          // HIPBLAS_OP_N or HIPBLAS_OP_T
-    const size_t m,                         // Number of rows of C
-    const size_t n,                         // Number of columns of C
-    const size_t k,                         // Inner dimension <= 2^17
-    const T *alpha,                         // Scaling factor for op(A)*op(B)
-    const T *const A,                       // 1-D device array of dimensions lda*k (HIPBLAS_OP_N) or lda*m (HIPBLAS_OP_T)
-    const size_t lda,                       // Leading dimension of A
-    const T *const B,                       // 1-D device array of dimensions ldb*n (HIPBLAS_OP_N) or ldb*k (HIPBLAS_OP_T)
-    const size_t ldb,                       // Leading dimension of B
-    const T *beta,                          // Scaling factor for C
-    T *const C,                             // 1-D device array of dimensions ldc*n
-    const size_t ldc,                       // Leading dimension of C
-    const unsigned num_moduli,              // #moduli, 2 <= num_moduli <= 20
-    const bool fastmode,                    // false (accurate mode) or true (fast mode)
-    void *const work,                       // Preallocated workspace
-    void *const workA            = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
-    void *const workB            = nullptr, // [optional] Separate workspace for B (if nullptr, uses work)
-    const bool enable_skip_scalA = false,   // [optional] Enables scaling-skip mechanism for A
-    const bool enable_skip_scalB = false,   // [optional] Enables scaling-skip mechanism for B
-    const bool skip_scalA        = false,   // [optional] If true, skip preprocessing for A
-    const bool skip_scalB        = false    // [optional] If true, skip preprocessing for B
-);
-#endif
-
-} // namespace gemmul8
-```
-
-#### `UseExtraWorkspace` (template parameter)
-
-`UseExtraWorkspace` trades GPU memory usage for higher performance.
-
-- `UseExtraWorkspace = true` (default)
-  Enables an implementation that uses additional workspace memory to reduce kernel launch overhead, resulting in higher performance.
-
-- `UseExtraWorkspace = false`
-  Uses a normal implementation with lower workspace requirements, at the cost of reduced performance.
-
-This option does not affect numerical accuracy or reproducibility.
-Only memory usage and performance characteristics differ.
+- `gemmul8::workSize<is_Complex, Backend>(...)`
+- `gemmul8::gemm<T, Backend>(...)` (BLAS handle / Lt handle overloads)
 
 #### Behavior of `skip_scalA` / `skip_scalB`
 

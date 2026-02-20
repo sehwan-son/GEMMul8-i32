@@ -12,6 +12,7 @@
     #include <hip/hip_complex.h>
 #endif
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace gemmul8 {
@@ -47,8 +48,58 @@ size_t workSize_i32(
     size_t n,                         // Number of columns of C
     size_t k,                         // Inner dimension <= 2^17
     unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
-    size_t *workSizeA      = nullptr, // [option] Output: workspace size used for A8i
-    size_t *workSizeB      = nullptr  // [option] Output: workspace size used for B8i
+    size_t *workSizeA      = nullptr, // [optional] Output: workspace size used for A8i
+    size_t *workSizeB      = nullptr  // [optional] Output: workspace size used for B8i
+);
+
+/***
+ * INT32 GEMM emulation using INT8 Tensor Cores
+ * Computes: C = alpha * op(A) * op(B) + beta * C
+ * Input type: int32, output type: int64
+ */
+template <bool UseExtraWorkspace = true>
+std::vector<double> gemm_i32(
+    cublasHandle_t handle,            // Handle to the cuBLAS library context
+    cublasOperation_t op_A,           // CUBLAS_OP_N or CUBLAS_OP_T
+    cublasOperation_t op_B,           // CUBLAS_OP_N or CUBLAS_OP_T
+    size_t m,                         // Number of rows of C
+    size_t n,                         // Number of columns of C
+    size_t k,                         // Inner dimension <= 2^17
+    const int64_t *alpha,             // Scaling factor for op(A)*op(B)
+    const int32_t *const A,           // 1-D device array of dimensions lda*k (CUBLAS_OP_N) or lda*m (CUBLAS_OP_T)
+    size_t lda,                       // Leading dimension of A
+    const int32_t *const B,           // 1-D device array of dimensions ldb*n (CUBLAS_OP_N) or ldb*k (CUBLAS_OP_T)
+    size_t ldb,                       // Leading dimension of B
+    const int64_t *beta,              // Scaling factor for C
+    int64_t *const C,                 // 1-D device array of dimensions ldc*n
+    size_t ldc,                       // Leading dimension of C
+    unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
+    void *const work,                 // Preallocated workspace
+    void *const workA      = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
+    void *const workB      = nullptr  // [optional] Separate workspace for B (if nullptr, uses work)
+);
+
+/***
+ * Convenience overload with alpha=1 and beta=0.
+ */
+template <bool UseExtraWorkspace = true>
+std::vector<double> gemm_i32(
+    cublasHandle_t handle,            // Handle to the cuBLAS library context
+    cublasOperation_t op_A,           // CUBLAS_OP_N or CUBLAS_OP_T
+    cublasOperation_t op_B,           // CUBLAS_OP_N or CUBLAS_OP_T
+    size_t m,                         // Number of rows of C
+    size_t n,                         // Number of columns of C
+    size_t k,                         // Inner dimension <= 2^17
+    const int32_t *const A,           // 1-D device array of dimensions lda*k (CUBLAS_OP_N) or lda*m (CUBLAS_OP_T)
+    size_t lda,                       // Leading dimension of A
+    const int32_t *const B,           // 1-D device array of dimensions ldb*n (CUBLAS_OP_N) or ldb*k (CUBLAS_OP_T)
+    size_t ldb,                       // Leading dimension of B
+    int64_t *const C,                 // 1-D device array of dimensions ldc*n
+    size_t ldc,                       // Leading dimension of C
+    unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
+    void *const work,                 // Preallocated workspace
+    void *const workA      = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
+    void *const workB      = nullptr  // [optional] Separate workspace for B (if nullptr, uses work)
 );
 #endif
 
@@ -81,6 +132,34 @@ std::vector<double> gemm(
     bool enable_skip_scalB = false,   // [optional] Enables scaling-skip mechanism for B
     bool skip_scalA        = false,   // [optional] If true, skip preprocessing for A
     bool skip_scalB        = false    // [optional] If true, skip preprocessing for B
+);
+
+template <typename T, Backend backend = Backend::INT8>
+std::vector<double> gemm(
+    cublasLtHandle_t handle,          // Handle to the cuBLASLt library context
+    cublasOperation_t op_A,           // CUBLAS_OP_N, CUBLAS_OP_T, or CUBLAS_OP_C
+    cublasOperation_t op_B,           // CUBLAS_OP_N, CUBLAS_OP_T, or CUBLAS_OP_C
+    size_t m,                         // Number of rows of C
+    size_t n,                         // Number of columns of C
+    size_t k,                         // Inner dimension <= 2^17
+    const T *alpha,                   // Scaling factor for op(A)*op(B)
+    const T *const A,                 // 1-D device array of dimensions lda*k (CUBLAS_OP_N) or lda*m (CUBLAS_OP_T/C)
+    size_t lda,                       // Leading dimension of A
+    const T *const B,                 // 1-D device array of dimensions ldb*n (CUBLAS_OP_N) or ldb*k (CUBLAS_OP_T/C)
+    size_t ldb,                       // Leading dimension of B
+    const T *beta,                    // Scaling factor for C
+    T *const C,                       // 1-D device array of dimensions ldc*n
+    size_t ldc,                       // Leading dimension of C
+    unsigned num_moduli,              // #moduli, 2 <= num_moduli <= 20 for FP64, 2 <= num_moduli <= 13 for FP32
+    bool fastmode,                    // false (accurate mode) or true (fast mode)
+    void *const work,                 // Preallocated workspace
+    void *const workA      = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
+    void *const workB      = nullptr, // [optional] Separate workspace for B (if nullptr, uses work)
+    bool enable_skip_scalA = false,   // [optional] Enables scaling-skip mechanism for A
+    bool enable_skip_scalB = false,   // [optional] Enables scaling-skip mechanism for B
+    bool skip_scalA        = false,   // [optional] If true, skip preprocessing for A
+    bool skip_scalB        = false,   // [optional] If true, skip preprocessing for B
+    cudaStream_t stream    = 0        // [optional] stream identifier
 );
 #endif
 

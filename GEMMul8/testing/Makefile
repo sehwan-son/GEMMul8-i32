@@ -6,6 +6,7 @@ CUDA_PATH ?= /usr/local/cuda
 HIP_PATH ?= /opt/rocm
 BACKEND ?= auto
 GPU_ARCH ?= auto
+PRELOAD_LIB ?=
 
 
 #===============
@@ -30,14 +31,14 @@ endif
 ifeq ($(BACKEND),cuda)
 
 ifeq ($(GPU_ARCH),auto)
-GPU_ARCH := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1 | tr -d '.')
+GPU_ARCH := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -dc '0-9')
+ifeq ($(GPU_ARCH),)
+GPU_ARCH := 80
+endif
 endif
 
-# get memory size (fallback to 0 when NVML query is unavailable)
-GPU_MEM_MB := $(shell nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -dc '0-9')
-ifeq ($(GPU_MEM_MB),)
-GPU_MEM_MB := 0
-endif
+# Hardcoded for GB10 (128GB) to avoid NVML reporting [N/A] in restricted environments.
+GPU_MEM_MB ?= 128000
 
 export PATH := $(CUDA_PATH)/bin:$(PATH)
 export LD_LIBRARY_PATH := $(CUDA_PATH)/lib64:$(LD_LIBRARY_PATH)
@@ -80,19 +81,17 @@ endif
 #===============
 # Compile
 #===============
-TARGET_d := test_double
-TARGET_f := test_float
-TARGET_z := test_double_complex
-TARGET_c := test_float_complex
-TARGET_i := test_int32
-TARGET_ib := test_int32_bench
 
-TARGETS := $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c)
+TARGET := test
+TARGET_I32 := test_int32
+TARGET_I32_BENCH := test_int32_bench
+
+TARGETS := $(TARGET)
 ifeq ($(BACKEND),cuda)
-TARGETS += $(TARGET_i) $(TARGET_ib)
+TARGETS += $(TARGET_I32) $(TARGET_I32_BENCH)
 endif
 
-all: INFO $(TARGETS) VERSION
+all: INFO VERSION $(TARGETS)
 
 INFO:
 	$(info BACKEND      : $(BACKEND))
@@ -110,10 +109,10 @@ $(TARGET): $(TARGET).cu
 	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
 
 ifeq ($(BACKEND),cuda)
-$(TARGET_i): $(TARGET_i).cu
+$(TARGET_I32): $(TARGET_I32).cu
 	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
 
-$(TARGET_ib): $(TARGET_ib).cu
+$(TARGET_I32_BENCH): $(TARGET_I32_BENCH).cu
 	$(COMPILER) $< $(FLAGS) $(ARCH) -o $@ $(LIBS)
 endif
 
@@ -125,12 +124,20 @@ run:
 
 ifeq ($(BACKEND),cuda)
 test_i32:
-	LD_PRELOAD=$(LD) ./$(TARGET_i)
+ifeq ($(strip $(PRELOAD_LIB)),)
+	./$(TARGET_I32) $(MODE)
+else
+	LD_PRELOAD=$(PRELOAD_LIB) ./$(TARGET_I32) $(MODE)
+endif
 
 bench_i32:
-	LD_PRELOAD=$(LD) ./$(TARGET_ib) $(MODE)
+ifeq ($(strip $(PRELOAD_LIB)),)
+	./$(TARGET_I32_BENCH) $(MODE)
+else
+	LD_PRELOAD=$(PRELOAD_LIB) ./$(TARGET_I32_BENCH) $(MODE)
+endif
 endif
 
 clean:
 	rm -f *.o
-	rm -f $(TARGET_d) $(TARGET_f) $(TARGET_z) $(TARGET_c) $(TARGET_i) $(TARGET_ib)
+	rm -f $(TARGET) $(TARGET_I32) $(TARGET_I32_BENCH)

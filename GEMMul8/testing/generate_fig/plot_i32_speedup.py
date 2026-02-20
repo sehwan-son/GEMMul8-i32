@@ -13,6 +13,8 @@ import os
 import sys
 from collections import defaultdict
 
+from plot_i32_common import LinePlotOptions, plot_lines
+
 
 METRIC_LABELS = {
     "speedup_vs_exact_i32_i32_i64": "Speedup vs exact int32*int32->int64 GPU baseline",
@@ -24,12 +26,39 @@ METRIC_LABELS = {
     "gemmul8_conv32to8_ms": "GEMMul8 conv32->8 time (ms)",
     "gemmul8_reconstruct_ms": "GEMMul8 reconstruct time (ms)",
     "exact_i32_i32_i64_ms": "Exact int32*int32->int64 time (ms)",
+    "baseline_i32_cuda_core_ms": "Baseline i32 CUDA-core time (ms)",
     "cublas_i8_single_ms": "cuBLAS int8 single GEMM time (ms)",
     "cublas_i8_x_moduli_ms": "cuBLAS int8 x num_moduli time (ms)",
     "gemmul8_gflops": "GEMMul8 throughput (GFLOPS)",
     "exact_i32_i32_i64_gflops": "Exact int32*int32->int64 throughput (GFLOPS)",
+    "baseline_i32_cuda_core_gflops": "Baseline i32 CUDA-core throughput (GFLOPS)",
+    "speedup_vs_baseline_i32_cuda_core": "Speedup vs baseline i32 CUDA-core",
     "cublas_i8_single_gflops": "cuBLAS int8 single GEMM throughput (GFLOPS)",
     "cublas_i8_x_moduli_gflops": "cuBLAS int8 x num_moduli throughput (GFLOPS)",
+    "gemmul8_max_abs_error": "GEMMul8 max abs error vs exact int64",
+    "gemmul8_mismatch_count": "GEMMul8 mismatch count vs exact int64",
+    "gemmul8_exact_match": "GEMMul8 exact-match flag (1=yes)",
+    "gemmul8_watt": "GEMMul8 power (W)",
+    "gemmul8_gflops_per_watt": "GEMMul8 efficiency (GFLOPS/W)",
+    "exact_i32_i32_i64_watt": "Exact int32*int32->int64 power (W)",
+    "exact_i32_i32_i64_gflops_per_watt": "Exact int32*int32->int64 efficiency (GFLOPS/W)",
+    "cublas_i8_single_watt": "cuBLAS int8 single GEMM power (W)",
+    "cublas_i8_single_gflops_per_watt": "cuBLAS int8 single GEMM efficiency (GFLOPS/W)",
+    "cublas_i8_x_moduli_watt": "cuBLAS int8 x num_moduli power (W)",
+    "cublas_i8_x_moduli_gflops_per_watt": "cuBLAS int8 x num_moduli efficiency (GFLOPS/W)",
+}
+
+INT8_AUX_METRICS = {
+    "speedup_vs_cublas_i8_single",
+    "speedup_vs_cublas_i8_x_moduli",
+    "cublas_i8_single_ms",
+    "cublas_i8_x_moduli_ms",
+    "cublas_i8_single_gflops",
+    "cublas_i8_x_moduli_gflops",
+    "cublas_i8_single_watt",
+    "cublas_i8_single_gflops_per_watt",
+    "cublas_i8_x_moduli_watt",
+    "cublas_i8_x_moduli_gflops_per_watt",
 }
 
 BREAKDOWN_SERIES = [
@@ -79,9 +108,27 @@ def parse_args() -> argparse.Namespace:
         help="Include exact_i32_i32_i64_ms in --plot-type breakdown",
     )
     parser.add_argument(
+        "--percent",
+        action="store_true",
+        help="For --plot-type breakdown, normalize each stage by gemmul8_total_ms (%%).",
+    )
+    parser.add_argument(
+        "--x-axis",
+        default="n",
+        choices=["n", "m", "k", "mnk"],
+        help="X-axis dimension for rectangular benchmarking support.",
+    )
+    parser.add_argument("--yscale", default="auto", choices=["auto", "linear", "log"])
+    parser.add_argument("--ylim-mode", default="robust", choices=["robust", "full"])
+    parser.add_argument(
         "--output",
         default="",
         help="Output image path (default: inferred from CSV + plot mode/metric)",
+    )
+    parser.add_argument(
+        "--show-int8-aux",
+        action="store_true",
+        help="Enable plotting of int8 auxiliary baseline metrics.",
     )
     return parser.parse_args()
 
@@ -114,6 +161,21 @@ def metric_value(row: dict, key: str):
         return float(raw)
     except ValueError:
         return None
+
+
+def x_value_from_row(row: dict, x_axis: str) -> int:
+    m = int(float(row["m"]))
+    n = int(float(row["n"]))
+    k = int(float(row["k"]))
+    if x_axis == "m":
+        return m
+    if x_axis == "n":
+        return n
+    if x_axis == "k":
+        return k
+    if x_axis == "mnk":
+        return m * n * k
+    raise ValueError(f"invalid x-axis: {x_axis}")
 
 
 def save_svg_plot(grouped, title: str, xlabel: str, ylabel: str, output: str) -> None:
@@ -231,17 +293,19 @@ def save_svg_plot(grouped, title: str, xlabel: str, ylabel: str, output: str) ->
 def main() -> int:
     args = parse_args()
 
+    if not args.show_int8_aux and args.plot_type == "single" and args.metric in INT8_AUX_METRICS:
+        print(
+            f"[FAIL] metric '{args.metric}' is int8 auxiliary. "
+            "Use --show-int8-aux to plot it.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         mod_filter = parse_num_moduli_filter(args.num_moduli)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-
-    plt = None
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
-    except Exception:
-        plt = None
 
     if not os.path.isfile(args.csv):
         print(f"CSV file not found: {args.csv}", file=sys.stderr)
@@ -264,7 +328,7 @@ def main() -> int:
             if mod_filter is not None and mod != mod_filter:
                 continue
 
-            n = int(float(row["n"]))
+            x_val = x_value_from_row(row, args.x_axis)
             config = f"op={op_pair}, mod={mod}, use_extra={use_extra}"
 
             if args.plot_type == "single":
@@ -272,7 +336,7 @@ def main() -> int:
                 if value is None:
                     missing_metric_rows += 1
                     continue
-                grouped[config].append((n, value))
+                grouped[config].append((x_val, value))
             else:
                 is_fixed_config = (args.op != "all" and args.use_extra != "all" and mod_filter is not None)
                 stage_items = list(BREAKDOWN_SERIES)
@@ -283,8 +347,13 @@ def main() -> int:
                     value = metric_value(row, key)
                     if value is None:
                         continue
+                    if args.percent:
+                        total = metric_value(row, "gemmul8_total_ms")
+                        if total is None or total <= 0.0:
+                            continue
+                        value = value * 100.0 / total
                     label = stage_name if is_fixed_config else f"{stage_name}, {config}"
-                    grouped[label].append((n, value))
+                    grouped[label].append((x_val, value))
 
     if not grouped:
         print("No rows matched filters (or selected metric missing).", file=sys.stderr)
@@ -299,38 +368,35 @@ def main() -> int:
         suffix = args.metric
     else:
         title = "GEMMul8 i32 Stage Breakdown"
-        ylabel = "Time (ms)"
-        suffix = "breakdown_ms" if not args.include_baseline else "breakdown_ms_with_baseline"
+        ylabel = "Time (%)" if args.percent else "Time (ms)"
+        suffix = "breakdown_pct" if args.percent else "breakdown_ms"
+        if args.include_baseline:
+            suffix = suffix + "_with_baseline"
 
-    xlabel = "Matrix size n (m=n=k=n)"
+    if args.x_axis == "n":
+        xlabel = "n"
+    elif args.x_axis == "m":
+        xlabel = "m"
+    elif args.x_axis == "k":
+        xlabel = "k"
+    else:
+        xlabel = "m*n*k"
 
     output = args.output
     if not output:
         base = os.path.splitext(os.path.basename(args.csv))[0]
-        output = f"{base}_{suffix}.png" if plt else f"{base}_{suffix}.svg"
+        output = f"{base}_{suffix}"
 
-    if plt:
-        plt.figure(figsize=(9.8, 5.8))
-        for label, points in sorted(grouped.items()):
-            pts = sorted(points, key=lambda x: x[0])
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            plt.plot(xs, ys, marker="o", linewidth=1.6, label=label)
-
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        plt.legend(fontsize=8)
-        plt.tight_layout()
-        output = ensure_extension(output, ".png")
-        plt.savefig(output, dpi=160)
-    else:
-        output = ensure_extension(output, ".svg")
-        save_svg_plot(grouped, title, xlabel, ylabel, output)
+    include_zero = args.plot_type == "single" and "speedup" in args.metric
+    opts = LinePlotOptions(
+        yscale=args.yscale,
+        ylim_mode=args.ylim_mode,
+        include_zero=include_zero,
+    )
+    saved, backend = plot_lines(grouped, title, xlabel, ylabel, output, options=opts)
+    if backend == "svg":
         print("matplotlib not found: generated SVG plot instead.")
-
-    print(f"Saved plot: {output}")
+    print(f"Saved plot: {saved}")
     return 0
 
 
