@@ -68,6 +68,7 @@ def _preferred_base_order(precision: str) -> List[str]:
     if precision == "d":
         return [
             "DGEMM",
+            "OS2-accu",
             "ozIMMU_EF-8",
             "ozIMMU_EF-9",
             "OS1-7",
@@ -75,7 +76,6 @@ def _preferred_base_order(precision: str) -> List[str]:
             "OS1-9",
             "OS1-10",
             "OS2-fast",
-            "OS2-accu",
         ]
     return [
         "SGEMM",
@@ -181,6 +181,7 @@ def _plot_one_file(plt, path: Path, args: argparse.Namespace) -> Path:
         ax.spines["right"].set_visible(False)
         subplot_vals: List[float] = []
 
+        _MAIN_BASES = {"DGEMM", "SGEMM", "OS2-accu"}
         for k_idx, k in enumerate(k_values, start=1):
             for base_idx, base in enumerate(base_names, start=1):
                 key = (phi, base, k)
@@ -199,11 +200,15 @@ def _plot_one_file(plt, path: Path, args: argparse.Namespace) -> Path:
                     continue
                 subplot_vals.extend(y_plot)
                 label = base if k == k_values[0] else None
+                is_main = base in _MAIN_BASES
+                lw = 1.8 if is_main else 0.8
+                alpha = 1.0 if is_main else 0.45
                 (line,) = ax.plot(
                     x_plot,
                     y_plot,
                     wrapped_mark(k_idx, base_idx),
-                    linewidth=1.0,
+                    linewidth=lw,
+                    alpha=alpha,
                     label=label,
                 )
                 if label and label not in legend_handles:
@@ -237,22 +242,20 @@ def _plot_one_file(plt, path: Path, args: argparse.Namespace) -> Path:
 
     if legend_handles:
         legend_labels = list(legend_handles.keys())
-        ncol = legend_ncol(len(legend_labels), max_cols=4)
         fig.legend(
             list(legend_handles.values()),
             legend_labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 1.02),
+            bbox_to_anchor=(0.5, 1.0),
             fontsize=9,
-            ncol=ncol,
+            ncol=len(legend_labels),
+            frameon=False,
+            columnspacing=1.5,
         )
-
-    fig.suptitle(env_label_from_filename(path), fontsize=11)
 
     fig.supxlabel("Number of moduli", fontsize=10)
     fig.supylabel("max relative error", fontsize=10)
-    fig.text(0.5, 0.95, f"line-style by k: {', '.join(str(k) for k in k_values)}", ha="center", va="top", fontsize=8)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

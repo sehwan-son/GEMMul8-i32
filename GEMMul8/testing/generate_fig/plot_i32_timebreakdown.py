@@ -30,8 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--layout",
         default="n_sweep",
-        choices=["n_sweep", "moduli_sweep"],
-        help="n_sweep: fixed moduli and compare x-axis change (recommended), moduli_sweep: previous oz2-like view.",
+        choices=["n_sweep", "moduli_sweep", "compare"],
+        help="n_sweep: fixed moduli and compare x-axis change (recommended), "
+             "moduli_sweep: previous oz2-like view, "
+             "compare: side-by-side extra vs compact bars per n.",
     )
     parser.add_argument(
         "--target-moduli",
@@ -267,7 +269,7 @@ def main() -> int:
         fig.supxlabel(_x_title_name(args.x_axis), fontsize=10)
         fig.suptitle(f"i32 Stage Breakdown (moduli={target_moduli})", fontsize=11)
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
-    else:
+    elif args.layout == "moduli_sweep":
         x_values = sorted({int(r["_x"]) for r in rows})
         nrows = len(use_extra_values)
         ncols = len(x_values)
@@ -346,12 +348,139 @@ def main() -> int:
         fig.suptitle("i32 Stage Breakdown", fontsize=11)
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
 
+    elif args.layout == "compare":
+        if args.num_moduli != "all":
+            target_moduli = int(args.num_moduli)
+        else:
+            if args.target_moduli in moduli_values:
+                target_moduli = args.target_moduli
+            else:
+                target_moduli = moduli_values[0]
+                print(
+                    f"[WARN] target moduli {args.target_moduli} not found; using {target_moduli}.",
+                    file=sys.stderr,
+                )
+
+        rows = [r for r in rows if int(r["_mod"]) == target_moduli]
+        x_values = sorted({int(r["_x"]) for r in rows})
+        if not x_values:
+            print("No rows left after moduli filtering.", file=sys.stderr)
+            return 1
+
+        # One subplot per n value, grouped bars (extra vs compact) in each
+        ncols = len(x_values)
+        fig, axes = plt.subplots(
+            1,
+            ncols,
+            figsize=(1.95 * ncols + 1.7, 3.0),
+            squeeze=False,
+        )
+        axes_1d = axes[0]
+
+        group_width = args.bar_width
+        bar_w = group_width / 2.0
+        offsets = [-bar_w / 2.0, bar_w / 2.0]
+        mode_labels = ["extra (int32)", "compact (int8)"]
+        mode_keys = ["true", "false"]
+
+        for col_idx, x_val in enumerate(x_values):
+            ax = axes_1d[col_idx]
+            all_stacks: List[List[List[float]]] = []
+
+            for mi, ue in enumerate(mode_keys):
+                r = _get_row(rows, x_value=x_val, use_extra=ue, num_moduli=target_moduli)
+                vals = _stage_values(r)
+                if args.mode == "percent":
+                    vals = _to_percent(vals)
+                all_stacks.append([vals])
+
+                bottom = 0.0
+                for si, (_, label, color) in enumerate(STAGE_KEYS):
+                    h = vals[si]
+                    lbl = label if (col_idx == 0 and mi == 0) else None
+                    ax.bar(
+                        1 + offsets[mi],
+                        h,
+                        bottom=bottom,
+                        color=color,
+                        width=bar_w * 0.92,
+                        edgecolor="white",
+                        linewidth=0.4,
+                        label=lbl,
+                    )
+                    bottom += h
+
+                # Annotate total on top
+                total = sum(vals)
+                if args.mode == "ms" and total > 0:
+                    ax.text(
+                        1 + offsets[mi],
+                        total,
+                        f"{total:.2f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=6.5,
+                    )
+
+            ax.set_xticks([1 + offsets[0], 1 + offsets[1]])
+            ax.set_xticklabels(["extra", "compact"], fontsize=7)
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.tick_params(direction="out", labelsize=8)
+            ax.set_title(f"n={x_val}", fontsize=11)
+
+            if args.mode == "percent":
+                ax.set_ylim(0, 100)
+                ax.set_yticks([0, 25, 50, 75, 100])
+            else:
+                # Compute shared ylim later
+                pass
+
+            if col_idx > 0:
+                ax.set_yticklabels([])
+
+        # For ms mode, compute shared ylim
+        if args.mode == "ms":
+            all_totals: List[float] = []
+            for col_idx, x_val in enumerate(x_values):
+                for ue in mode_keys:
+                    r = _get_row(rows, x_value=x_val, use_extra=ue, num_moduli=target_moduli)
+                    vals = _stage_values(r)
+                    all_totals.append(sum(vals))
+            y_max = max(all_totals) * 1.15 if all_totals else 1.0
+            for ax in axes_1d:
+                ax.set_ylim(0, y_max)
+
+        if args.mode == "percent":
+            axes_1d[0].set_ylabel("%", fontsize=9)
+        else:
+            axes_1d[0].set_ylabel("ms", fontsize=9)
+
+        handles, labels = axes_1d[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                loc="upper center",
+                ncol=len(handles),
+                bbox_to_anchor=(0.5, 1.0),
+                fontsize=9,
+                frameon=False,
+                columnspacing=1.5,
+            )
+
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
+
     output = args.output
     if not output:
         base = os.path.splitext(os.path.basename(args.csv))[0]
         suffix = "timebreakdown_pct" if args.mode == "percent" else "timebreakdown_ms"
         if args.layout == "n_sweep":
             suffix += "_nsweep"
+        elif args.layout == "compare":
+            suffix += "_compare"
         if args.x_axis != "n":
             suffix += f"_{args.x_axis}"
         output = f"{base}_{suffix}.png"
