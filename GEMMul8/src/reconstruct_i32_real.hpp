@@ -6,8 +6,6 @@
 namespace oz2 {
 namespace i32 {
 
-inline constexpr unsigned crt_moduli_used = kMinNumModuli;
-
 __forceinline__ __device__ int32_t modinv_i32(int32_t a, const int32_t mod) {
     int32_t t     = 0;
     int32_t new_t = 1;
@@ -64,6 +62,7 @@ template <typename TCtmp>
 __global__ void reconstruct_kernel_general(
     const size_t m,
     const size_t sizeC,
+    const unsigned num_moduli,
     const size_t incCtmp,
     const TCtmp *const __restrict__ Ctmp,
     const size_t ldctmp,
@@ -81,20 +80,16 @@ __global__ void reconstruct_kernel_general(
     const auto mem_idx       = col * ldctmp + row;
     const TCtmp *const inptr = Ctmp + mem_idx;
 
-    int32_t residues[crt_moduli_used];
-#pragma unroll
-    for (unsigned i = 0; i < crt_moduli_used; ++i) {
-        residues[i] = get_nonneg_residue<TCtmp>(inptr, incCtmp, i);
-    }
-
-    __int128 x = residues[0];
+    __int128 x = get_nonneg_residue<TCtmp>(inptr, incCtmp, 0u);
     __int128 M = get_modulus(0u);
 
-#pragma unroll
-    for (unsigned i = 1; i < crt_moduli_used; ++i) {
+    for (unsigned i = 1; i < num_moduli; ++i) {
         const int32_t mod = get_modulus(i);
+        if (M > kInt128Max / static_cast<__int128>(mod)) break;
+
+        const int32_t residue_i = get_nonneg_residue<TCtmp>(inptr, incCtmp, i);
         const int32_t xi  = mod_nonneg(static_cast<int64_t>(x % mod), mod);
-        int32_t diff      = residues[i] - xi;
+        int32_t diff      = residue_i - xi;
         diff %= mod;
         if (diff < 0) diff += mod;
 
@@ -122,6 +117,7 @@ template <typename TCtmp, int ALPHA, int BETA>
 __global__ void reconstruct_kernel_special(
     const size_t m,
     const size_t sizeC,
+    const unsigned num_moduli,
     const size_t incCtmp,
     const TCtmp *const __restrict__ Ctmp,
     const size_t ldctmp,
@@ -137,20 +133,16 @@ __global__ void reconstruct_kernel_special(
     const auto mem_idx       = col * ldctmp + row;
     const TCtmp *const inptr = Ctmp + mem_idx;
 
-    int32_t residues[crt_moduli_used];
-#pragma unroll
-    for (unsigned i = 0; i < crt_moduli_used; ++i) {
-        residues[i] = get_nonneg_residue<TCtmp>(inptr, incCtmp, i);
-    }
-
-    __int128 x = residues[0];
+    __int128 x = get_nonneg_residue<TCtmp>(inptr, incCtmp, 0u);
     __int128 M = get_modulus(0u);
 
-#pragma unroll
-    for (unsigned i = 1; i < crt_moduli_used; ++i) {
+    for (unsigned i = 1; i < num_moduli; ++i) {
         const int32_t mod = get_modulus(i);
+        if (M > kInt128Max / static_cast<__int128>(mod)) break;
+
+        const int32_t residue_i = get_nonneg_residue<TCtmp>(inptr, incCtmp, i);
         const int32_t xi  = mod_nonneg(static_cast<int64_t>(x % mod), mod);
-        int32_t diff      = residues[i] - xi;
+        int32_t diff      = residue_i - xi;
         diff %= mod;
         if (diff < 0) diff += mod;
 
@@ -187,36 +179,38 @@ __inline__ void reconstruct(
     const size_t m, const size_t n,
     const TCtmp *const Ctmp,
     const size_t ldctmp,
+    const unsigned num_moduli,
     const size_t incCtmp,
     int64_t *const C,
     const size_t ldc,
     const int64_t alpha,
     const int64_t beta //
 ) {
+    validate_num_moduli_or_throw(num_moduli, "reconstruct_i32");
     const size_t sizeC = m * n;
     const size_t grid  = (sizeC + threads_invscal - 1) / threads_invscal;
 
     if (alpha == 1) {
         if (beta == 0) {
-            reconstruct_kernel_special<TCtmp, 1, 0><<<grid, threads_invscal, 0, stream>>>(m, sizeC, incCtmp, Ctmp, ldctmp, C, ldc);
+            reconstruct_kernel_special<TCtmp, 1, 0><<<grid, threads_invscal, 0, stream>>>(m, sizeC, num_moduli, incCtmp, Ctmp, ldctmp, C, ldc);
             return;
         }
         if (beta == 1) {
-            reconstruct_kernel_special<TCtmp, 1, 1><<<grid, threads_invscal, 0, stream>>>(m, sizeC, incCtmp, Ctmp, ldctmp, C, ldc);
+            reconstruct_kernel_special<TCtmp, 1, 1><<<grid, threads_invscal, 0, stream>>>(m, sizeC, num_moduli, incCtmp, Ctmp, ldctmp, C, ldc);
             return;
         }
     } else if (alpha == -1) {
         if (beta == 0) {
-            reconstruct_kernel_special<TCtmp, -1, 0><<<grid, threads_invscal, 0, stream>>>(m, sizeC, incCtmp, Ctmp, ldctmp, C, ldc);
+            reconstruct_kernel_special<TCtmp, -1, 0><<<grid, threads_invscal, 0, stream>>>(m, sizeC, num_moduli, incCtmp, Ctmp, ldctmp, C, ldc);
             return;
         }
         if (beta == 1) {
-            reconstruct_kernel_special<TCtmp, -1, 1><<<grid, threads_invscal, 0, stream>>>(m, sizeC, incCtmp, Ctmp, ldctmp, C, ldc);
+            reconstruct_kernel_special<TCtmp, -1, 1><<<grid, threads_invscal, 0, stream>>>(m, sizeC, num_moduli, incCtmp, Ctmp, ldctmp, C, ldc);
             return;
         }
     }
 
-    reconstruct_kernel_general<TCtmp><<<grid, threads_invscal, 0, stream>>>(m, sizeC, incCtmp, Ctmp, ldctmp, C, ldc, alpha, beta);
+    reconstruct_kernel_general<TCtmp><<<grid, threads_invscal, 0, stream>>>(m, sizeC, num_moduli, incCtmp, Ctmp, ldctmp, C, ldc, alpha, beta);
 }
 
 } // namespace i32

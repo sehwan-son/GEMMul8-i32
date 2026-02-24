@@ -147,6 +147,21 @@ The int8 cuBLAS baseline is treated as an auxiliary reference and is disabled by
 - default: auxiliary int8 baseline OFF
 - optional: enable with `--with-int8-baseline`
 
+You can also inject an external native int32 CUDA-core baseline CSV (for example from
+`sgemm-opt-intern/int32_core_results.csv`) to populate:
+
+- `baseline_i32_cuda_core_ms`
+- `baseline_i32_cuda_core_gflops`
+- `speedup_vs_baseline_i32_cuda_core`
+
+Options:
+
+- `--baseline-i32-csv <path>`
+- `--baseline-i32-policy <best|last>`
+
+Matching key: `(m,n,k,opA,opB)`.
+If no row matches (or no CSV is provided), baseline columns safely fall back to `exact_i32_i32_i64`.
+
 When auxiliary int8 baseline is OFF, CSV compatibility is preserved:
 
 - existing `cublas_i8_*` and `speedup_vs_cublas_i8_*` columns remain in the CSV header

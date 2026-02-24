@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot i32 GFLOPS/W.")
     parser.add_argument("csv", help="Path to i32_bench_speedup_*.csv")
     parser.add_argument("--op", default="all", choices=["all", "NN", "NT", "TN", "TT"])
+    parser.add_argument("--i32-scheme", default="all", choices=["all", "oz2", "oz1"])
     parser.add_argument("--use-extra", default="all", choices=["all", "true", "false"])
     parser.add_argument("--num-moduli", default="all")
     parser.add_argument("--x-axis", default="n", choices=["n", "m", "k", "mnk"])
@@ -48,7 +49,14 @@ def _get_watt(
 def main() -> int:
     args = parse_args()
     try:
-        rows = read_filtered_rows(args.csv, args.op, args.use_extra, args.num_moduli, x_axis=args.x_axis)
+        rows = read_filtered_rows(
+            args.csv,
+            args.op,
+            args.use_extra,
+            args.num_moduli,
+            i32_scheme=args.i32_scheme,
+            x_axis=args.x_axis,
+        )
         fieldnames = read_fieldnames(args.csv)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -67,7 +75,12 @@ def main() -> int:
         return 1
 
     grouped = defaultdict(list)
-    is_fixed_config = args.op != "all" and args.use_extra != "all" and args.num_moduli != "all"
+    is_fixed_config = (
+        args.op != "all"
+        and args.i32_scheme != "all"
+        and args.use_extra != "all"
+        and args.num_moduli != "all"
+    )
 
     for row in rows:
         x = int(row["_x"])

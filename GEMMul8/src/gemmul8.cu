@@ -45,6 +45,7 @@
 #include "gemmul8_complex.hpp"
 #if defined(__NVCC__)
     #include "gemmul8_i32.hpp"
+    #include "gemmul8_i32_os1.hpp"
 #endif
 
 #if !defined(GEMM_ARGS)
@@ -98,17 +99,31 @@ template <> size_t workSize<true, Backend::INT8>(size_t m, size_t n, size_t k, u
 template <> size_t workSize_i32<true>(
     size_t m, size_t n, size_t k,
     unsigned num_moduli,
-    size_t *workSizeA, size_t *workSizeB //
+    size_t *workSizeA, size_t *workSizeB,
+    I32Scheme scheme //
 ) {
-    return oz2::i32::workSize<true>(m, n, k, num_moduli, workSizeA, workSizeB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::workSize<true>(m, n, k, num_moduli, workSizeA, workSizeB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::workSize<true>(m, n, k, num_moduli, workSizeA, workSizeB);
+    }
 }
 
 template <> size_t workSize_i32<false>(
     size_t m, size_t n, size_t k,
     unsigned num_moduli,
-    size_t *workSizeA, size_t *workSizeB //
+    size_t *workSizeA, size_t *workSizeB,
+    I32Scheme scheme //
 ) {
-    return oz2::i32::workSize<false>(m, n, k, num_moduli, workSizeA, workSizeB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::workSize<false>(m, n, k, num_moduli, workSizeA, workSizeB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::workSize<false>(m, n, k, num_moduli, workSizeA, workSizeB);
+    }
 }
 #endif
 
@@ -180,9 +195,16 @@ template <> std::vector<double> gemm_i32<true>(
     unsigned num_moduli,
     void *const work,
     void *const workA,
-    void *const workB //
+    void *const workB,
+    I32Scheme scheme //
 ) {
-    return oz2::i32::gemm<true>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::gemm<true>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::gemm<true>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    }
 }
 
 template <> std::vector<double> gemm_i32<false>(
@@ -197,9 +219,16 @@ template <> std::vector<double> gemm_i32<false>(
     unsigned num_moduli,
     void *const work,
     void *const workA,
-    void *const workB //
+    void *const workB,
+    I32Scheme scheme //
 ) {
-    return oz2::i32::gemm<false>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::gemm<false>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::gemm<false>(handle, op_A, op_B, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, num_moduli, work, workA, workB);
+    }
 }
 
 template <> std::vector<double> gemm_i32<true>(
@@ -212,11 +241,18 @@ template <> std::vector<double> gemm_i32<true>(
     unsigned num_moduli,
     void *const work,
     void *const workA,
-    void *const workB //
+    void *const workB,
+    I32Scheme scheme //
 ) {
     constexpr int64_t alpha = 1;
     constexpr int64_t beta  = 0;
-    return oz2::i32::gemm<true>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::gemm<true>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::gemm<true>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    }
 }
 
 template <> std::vector<double> gemm_i32<false>(
@@ -229,11 +265,18 @@ template <> std::vector<double> gemm_i32<false>(
     unsigned num_moduli,
     void *const work,
     void *const workA,
-    void *const workB //
+    void *const workB,
+    I32Scheme scheme //
 ) {
     constexpr int64_t alpha = 1;
     constexpr int64_t beta  = 0;
-    return oz2::i32::gemm<false>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    switch (scheme) {
+    case I32Scheme::OZAKI1_SPLIT:
+        return oz1::i32::gemm<false>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    case I32Scheme::OZAKI2_CRT:
+    default:
+        return oz2::i32::gemm<false>(handle, op_A, op_B, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc, num_moduli, work, workA, workB);
+    }
 }
 #endif
 

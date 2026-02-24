@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         help="Operation pair filter",
     )
     parser.add_argument(
+        "--i32-scheme",
+        default="all",
+        choices=["all", "oz2", "oz1"],
+        help="i32 runtime scheme filter",
+    )
+    parser.add_argument(
         "--use-extra",
         default="all",
         choices=["all", "true", "false"],
@@ -320,8 +326,13 @@ def main() -> int:
             op_pair = f"{row['opA']}{row['opB']}"
             use_extra = to_bool_text(row["use_extra"])
             mod = int(float(row["num_moduli"]))
+            scheme = (row.get("i32_scheme", "oz2") or "oz2").strip().lower()
+            if scheme not in ("oz2", "oz1"):
+                scheme = "oz2"
 
             if args.op != "all" and op_pair != args.op:
+                continue
+            if args.i32_scheme != "all" and scheme != args.i32_scheme:
                 continue
             if args.use_extra != "all" and use_extra != args.use_extra:
                 continue
@@ -329,7 +340,7 @@ def main() -> int:
                 continue
 
             x_val = x_value_from_row(row, args.x_axis)
-            config = f"op={op_pair}, mod={mod}, use_extra={use_extra}"
+            config = f"scheme={scheme}, op={op_pair}, mod={mod}, use_extra={use_extra}"
 
             if args.plot_type == "single":
                 value = metric_value(row, args.metric)
@@ -338,7 +349,12 @@ def main() -> int:
                     continue
                 grouped[config].append((x_val, value))
             else:
-                is_fixed_config = (args.op != "all" and args.use_extra != "all" and mod_filter is not None)
+                is_fixed_config = (
+                    args.op != "all"
+                    and args.i32_scheme != "all"
+                    and args.use_extra != "all"
+                    and mod_filter is not None
+                )
                 stage_items = list(BREAKDOWN_SERIES)
                 if args.include_baseline:
                     stage_items.append(("exact_i32_i32_i64_ms", "baseline_exact_i32_i64"))

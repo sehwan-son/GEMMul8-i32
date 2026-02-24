@@ -14,11 +14,13 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -29,6 +31,39 @@ using OpPair = std::pair<cublasOperation_t, cublasOperation_t>;
 enum class CpuCheckMode { OFF,
                           SAMPLE,
                           FULL };
+
+enum class BaselineI32Policy {
+    BEST,
+    LAST
+};
+
+enum class I32SchemeMode {
+    OZ2,
+    OZ1,
+    BOTH
+};
+
+struct BaselineI32Key {
+    size_t m = 0;
+    size_t n = 0;
+    size_t k = 0;
+    char opA = 'N';
+    char opB = 'N';
+
+    bool operator<(const BaselineI32Key &rhs) const {
+        if (m != rhs.m) return m < rhs.m;
+        if (n != rhs.n) return n < rhs.n;
+        if (k != rhs.k) return k < rhs.k;
+        if (opA != rhs.opA) return opA < rhs.opA;
+        return opB < rhs.opB;
+    }
+};
+
+struct BaselineI32Value {
+    double time_ms = 0.0;
+    double gflops = 0.0;
+    size_t row_index = 0;
+};
 
 void check_cuda(const cudaError_t status, const char *const where) {
     if (status != cudaSuccess) {
@@ -259,11 +294,50 @@ CpuCheckMode parse_cpu_mode(const std::string &text) {
     throw std::invalid_argument("invalid --cpu-check: '" + text + "' (expected off|sample|full)");
 }
 
+BaselineI32Policy parse_baseline_i32_policy(const std::string &text) {
+    if (text == "best") return BaselineI32Policy::BEST;
+    if (text == "last") return BaselineI32Policy::LAST;
+    throw std::invalid_argument("invalid --baseline-i32-policy: '" + text + "' (expected best|last)");
+}
+
+I32SchemeMode parse_i32_scheme_mode(const std::string &text) {
+    const std::string t = trim_copy(text);
+    if (t == "oz2") return I32SchemeMode::OZ2;
+    if (t == "oz1") return I32SchemeMode::OZ1;
+    if (t == "both") return I32SchemeMode::BOTH;
+    throw std::invalid_argument("invalid --i32-scheme value: '" + text + "' (expected oz2|oz1|both)");
+}
+
+const char *i32_scheme_tag(const gemmul8::I32Scheme scheme) {
+    switch (scheme) {
+    case gemmul8::I32Scheme::OZAKI1_SPLIT: return "oz1";
+    case gemmul8::I32Scheme::OZAKI2_CRT:
+    default: return "oz2";
+    }
+}
+
+const char *i32_scheme_mode_name(const I32SchemeMode mode) {
+    switch (mode) {
+    case I32SchemeMode::OZ2: return "oz2";
+    case I32SchemeMode::OZ1: return "oz1";
+    case I32SchemeMode::BOTH:
+    default: return "both";
+    }
+}
+
 const char *cpu_mode_name(const CpuCheckMode mode) {
     switch (mode) {
     case CpuCheckMode::OFF: return "off";
     case CpuCheckMode::SAMPLE: return "sample";
     case CpuCheckMode::FULL: return "full";
+    }
+    return "unknown";
+}
+
+const char *baseline_i32_policy_name(const BaselineI32Policy mode) {
+    switch (mode) {
+    case BaselineI32Policy::BEST: return "best";
+    case BaselineI32Policy::LAST: return "last";
     }
     return "unknown";
 }
@@ -279,14 +353,180 @@ void validate_moduli_list(const std::vector<unsigned> &moduli) {
     }
 }
 
+std::vector<unsigned> make_auto_moduli_candidates(
+    const uint64_t max_abs_a,
+    const uint64_t max_abs_b,
+    const size_t k,
+    const bool tune_moduli,
+    const int tune_window //
+) {
+    unsigned required = oz2::i32::required_num_moduli_for_bounds(max_abs_a, max_abs_b, k);
+    required = std::max(required, oz2::i32::kMinNumModuli);
+    if (required > oz2::i32::kMaxNumModuli) {
+        throw std::runtime_error(
+            "auto-selected required_num_moduli exceeds supported range. reduce --input-bound or k.");
+    }
+
+    const unsigned upper = tune_moduli
+                               ? std::min<unsigned>(
+                                     oz2::i32::kMaxNumModuli,
+                                     static_cast<unsigned>(required + std::max(0, tune_window)))
+                               : required;
+
+    std::vector<unsigned> out;
+    out.reserve(static_cast<size_t>(upper - required + 1u));
+    for (unsigned mod = required; mod <= upper; ++mod) {
+        out.push_back(mod);
+    }
+    return out;
+}
+
+std::vector<std::string> split_csv_line_simple(const std::string &line) {
+    std::vector<std::string> out;
+    size_t begin = 0;
+    while (begin <= line.size()) {
+        const size_t comma = line.find(',', begin);
+        const size_t end = (comma == std::string::npos) ? line.size() : comma;
+        out.emplace_back(line.substr(begin, end - begin));
+        if (comma == std::string::npos) break;
+        begin = comma + 1u;
+    }
+    return out;
+}
+
+int find_col_index(const std::vector<std::string> &header, const std::vector<std::string> &candidates) {
+    for (size_t i = 0; i < header.size(); ++i) {
+        for (const auto &name : candidates) {
+            if (header[i] == name) return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+double parse_csv_double(const std::vector<std::string> &row, const int idx, const char *const field_name) {
+    if (idx < 0 || idx >= static_cast<int>(row.size())) {
+        throw std::runtime_error(std::string("missing field: ") + field_name);
+    }
+    return parse_double_arg(trim_copy(row[static_cast<size_t>(idx)]), field_name);
+}
+
+uint64_t parse_csv_u64(const std::vector<std::string> &row, const int idx, const char *const field_name) {
+    if (idx < 0 || idx >= static_cast<int>(row.size())) {
+        throw std::runtime_error(std::string("missing field: ") + field_name);
+    }
+    const std::string token = trim_copy(row[static_cast<size_t>(idx)]);
+    try {
+        size_t parsed = 0;
+        const unsigned long long value = std::stoull(token, &parsed);
+        if (parsed != token.size()) throw std::invalid_argument("trailing");
+        return static_cast<uint64_t>(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string("invalid ") + field_name + ": '" + token + "'");
+    }
+}
+
+size_t parse_csv_size(const std::vector<std::string> &row, const int idx, const char *const field_name) {
+    if (idx < 0 || idx >= static_cast<int>(row.size())) {
+        throw std::runtime_error(std::string("missing field: ") + field_name);
+    }
+    return parse_positive_size_token(trim_copy(row[static_cast<size_t>(idx)]), field_name);
+}
+
+char parse_csv_op_char(const std::vector<std::string> &row, const int idx, const char default_value) {
+    if (idx < 0 || idx >= static_cast<int>(row.size())) return default_value;
+    const std::string token = trim_copy(row[static_cast<size_t>(idx)]);
+    if (token.empty()) return default_value;
+    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(token[0])));
+    return (c == 'T') ? 'T' : 'N';
+}
+
+std::map<BaselineI32Key, BaselineI32Value> load_baseline_i32_csv(
+    const std::string &path,
+    const BaselineI32Policy policy //
+) {
+    std::map<BaselineI32Key, BaselineI32Value> out;
+    if (path.empty()) return out;
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        throw std::runtime_error("cannot open --baseline-i32-csv: " + path);
+    }
+
+    std::string header_line;
+    if (!std::getline(in, header_line)) {
+        throw std::runtime_error("empty --baseline-i32-csv: " + path);
+    }
+
+    const std::vector<std::string> header = split_csv_line_simple(header_line);
+    const int idx_m = find_col_index(header, {"M", "m"});
+    const int idx_n = find_col_index(header, {"N", "n"});
+    const int idx_k = find_col_index(header, {"K", "k"});
+    const int idx_opA = find_col_index(header, {"opA"});
+    const int idx_opB = find_col_index(header, {"opB"});
+    const int idx_time = find_col_index(header, {"time_ms"});
+    const int idx_gflops = find_col_index(header, {"gflops"});
+    const int idx_mismatch = find_col_index(header, {"mismatch_count"});
+
+    if (idx_m < 0 || idx_n < 0 || idx_k < 0 || idx_time < 0 || idx_gflops < 0) {
+        throw std::runtime_error(
+            "invalid --baseline-i32-csv header: require M/N/K(or m/n/k), time_ms, gflops");
+    }
+
+    size_t row_idx = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        row_idx++;
+        const std::string trimmed = trim_copy(line);
+        if (trimmed.empty()) continue;
+
+        const std::vector<std::string> row = split_csv_line_simple(trimmed);
+        BaselineI32Key key {};
+        key.m = parse_csv_size(row, idx_m, "M");
+        key.n = parse_csv_size(row, idx_n, "N");
+        key.k = parse_csv_size(row, idx_k, "K");
+        key.opA = parse_csv_op_char(row, idx_opA, 'N');
+        key.opB = parse_csv_op_char(row, idx_opB, 'N');
+
+        BaselineI32Value val {};
+        val.time_ms = parse_csv_double(row, idx_time, "time_ms");
+        val.gflops = parse_csv_double(row, idx_gflops, "gflops");
+        val.row_index = row_idx;
+        if (!std::isfinite(val.time_ms) || val.time_ms <= 0.0) continue;
+        if (!std::isfinite(val.gflops) || val.gflops <= 0.0) continue;
+        if (idx_mismatch >= 0) {
+            const uint64_t mismatch_count = parse_csv_u64(row, idx_mismatch, "mismatch_count");
+            if (mismatch_count != 0u) continue;
+        }
+
+        auto it = out.find(key);
+        if (it == out.end()) {
+            out.emplace(key, val);
+            continue;
+        }
+
+        if (policy == BaselineI32Policy::LAST) {
+            it->second = val;
+        } else {
+            if (val.time_ms < it->second.time_ms) {
+                it->second = val;
+            }
+        }
+    }
+
+    return out;
+}
+
 void print_usage(const char *const prog) {
     std::cout
         << "Usage:\n"
         << "  " << prog << " [iters] [warmup] [sizes_csv] [moduli_csv]\n"
         << "  " << prog << " --iters <int> --warmup <int>\n"
         << "           [--sizes <n1,n2,...> | --shapes <m1xn1xk1,m2xn2xk2,...>]\n"
-        << "           [--moduli <9,10,...,20>] [--ops <NN,NT,TN,TT>] [--watt]\n"
+        << "           [--moduli <5,6,...,20>] [--ops <NN,NT,TN,TT>] [--watt]\n"
+        << "           [--i32-scheme <oz2|oz1|both>]\n"
+        << "           [--tune-moduli] [--moduli-tune-window <int>]\n"
         << "           [--with-int8-baseline]\n"
+        << "           [--baseline-i32-csv <path>] [--baseline-i32-policy <best|last>]\n"
         << "           [--phi <double>] [--scale-exp <int>] [--input-bound <int>]\n"
         << "           [--cpu-check <off|sample|full>] [--cpu-samples <int>]\n"
         << "Examples:\n"
@@ -300,7 +540,7 @@ struct CliConfig {
     int iters = 5;
     int warmup = 2;
     std::vector<Shape3> shapes = make_square_shapes({256u, 512u, 1024u, 2048u, 4096u, 8192u, 16384u});
-    std::vector<unsigned> moduli = {9u};
+    std::vector<unsigned> moduli = {5u};
     bool moduli_explicit = false;
     std::vector<OpPair> ops = {
         {CUBLAS_OP_N, CUBLAS_OP_N},
@@ -310,6 +550,11 @@ struct CliConfig {
     int scale_exp = 10;
     int input_bound = 1024;
     bool with_int8_baseline = false;
+    I32SchemeMode i32_scheme = I32SchemeMode::BOTH;
+    bool tune_moduli = false;
+    int moduli_tune_window = 2;
+    std::string baseline_i32_csv {};
+    BaselineI32Policy baseline_i32_policy = BaselineI32Policy::BEST;
     CpuCheckMode cpu_check_mode = CpuCheckMode::SAMPLE;
     int cpu_samples = 64;
 };
@@ -338,7 +583,7 @@ CliConfig parse_cli(const int argc, char **argv) {
         if (argc >= 6) {
             throw std::invalid_argument("too many positional args. Use --help for usage.");
         }
-        validate_moduli_list(cfg.moduli);
+        if (cfg.moduli_explicit) validate_moduli_list(cfg.moduli);
         return cfg;
     }
 
@@ -383,8 +628,32 @@ CliConfig parse_cli(const int argc, char **argv) {
             cfg.enable_watt = true;
             continue;
         }
+        if (arg == "--tune-moduli") {
+            cfg.tune_moduli = true;
+            continue;
+        }
+        if (arg == "--i32-scheme") {
+            if (i + 1 >= argc) throw std::invalid_argument("--i32-scheme requires a value");
+            cfg.i32_scheme = parse_i32_scheme_mode(argv[++i]);
+            continue;
+        }
+        if (arg == "--moduli-tune-window") {
+            if (i + 1 >= argc) throw std::invalid_argument("--moduli-tune-window requires a value");
+            cfg.moduli_tune_window = std::max(0, parse_int_arg(argv[++i], "--moduli-tune-window"));
+            continue;
+        }
         if (arg == "--with-int8-baseline") {
             cfg.with_int8_baseline = true;
+            continue;
+        }
+        if (arg == "--baseline-i32-csv") {
+            if (i + 1 >= argc) throw std::invalid_argument("--baseline-i32-csv requires a value");
+            cfg.baseline_i32_csv = argv[++i];
+            continue;
+        }
+        if (arg == "--baseline-i32-policy") {
+            if (i + 1 >= argc) throw std::invalid_argument("--baseline-i32-policy requires a value");
+            cfg.baseline_i32_policy = parse_baseline_i32_policy(argv[++i]);
             continue;
         }
         if (arg == "--phi") {
@@ -415,7 +684,7 @@ CliConfig parse_cli(const int argc, char **argv) {
         throw std::invalid_argument("unknown option: " + arg);
     }
 
-    validate_moduli_list(cfg.moduli);
+    if (cfg.moduli_explicit) validate_moduli_list(cfg.moduli);
     return cfg;
 }
 
@@ -895,6 +1164,7 @@ StageRatio to_stage_ratio(const I32BenchBreakdown &b) {
 template <bool UseExtraWorkspace>
 I32BenchBreakdown bench_gemmul8_i32_ms(
     cublasHandle_t handle,
+    const gemmul8::I32Scheme scheme,
     const cublasOperation_t op_A,
     const cublasOperation_t op_B,
     const size_t m,
@@ -913,7 +1183,7 @@ I32BenchBreakdown bench_gemmul8_i32_ms(
     constexpr int64_t alpha = 1;
     constexpr int64_t beta = 0;
     void *work = nullptr;
-    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(m, n, k, num_moduli);
+    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(m, n, k, num_moduli, nullptr, nullptr, scheme);
     check_cuda(cudaMalloc(&work, work_size), "cudaMalloc work");
 
     for (int i = 0; i < warmup; ++i) {
@@ -933,7 +1203,10 @@ I32BenchBreakdown bench_gemmul8_i32_ms(
             dC,
             ldc,
             num_moduli,
-            work);
+            work,
+            nullptr,
+            nullptr,
+            scheme);
     }
     check_cuda(cudaDeviceSynchronize(), "gemm_i32 warmup sync");
 
@@ -955,7 +1228,10 @@ I32BenchBreakdown bench_gemmul8_i32_ms(
             dC,
             ldc,
             num_moduli,
-            work);
+            work,
+            nullptr,
+            nullptr,
+            scheme);
         for (size_t j = 0; j < 4; ++j) {
             accum_ns[j] += t_ns[j];
         }
@@ -978,6 +1254,7 @@ I32BenchBreakdown bench_gemmul8_i32_ms(
 template <bool UseExtraWorkspace>
 std::vector<double> bench_gemmul8_i32_watt(
     cublasHandle_t handle,
+    const gemmul8::I32Scheme scheme,
     const cublasOperation_t op_A,
     const cublasOperation_t op_B,
     const size_t m,
@@ -995,7 +1272,7 @@ std::vector<double> bench_gemmul8_i32_watt(
     constexpr int64_t beta = 0;
 
     void *work = nullptr;
-    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(m, n, k, num_moduli);
+    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(m, n, k, num_moduli, nullptr, nullptr, scheme);
     check_cuda(cudaMalloc(&work, work_size), "cudaMalloc gemmul8 watt work");
 
     const std::vector<double> res = getWatt::getWatt(
@@ -1016,7 +1293,10 @@ std::vector<double> bench_gemmul8_i32_watt(
                 dC64,
                 ldc,
                 num_moduli,
-                work);
+                work,
+                nullptr,
+                nullptr,
+                scheme);
         },
         m,
         n,
@@ -1053,6 +1333,37 @@ PrecisionReport evaluate_precision(
     return out;
 }
 
+PrecisionReport evaluate_precision_oz1(
+    const uint64_t max_abs_a,
+    const uint64_t max_abs_b,
+    const size_t k //
+) {
+    PrecisionReport out;
+    out.required_num_moduli = 5u;
+    out.crt_dynamic_range = 0;
+
+    const __int128 per_term =
+        static_cast<__int128>(max_abs_a) *
+        static_cast<__int128>(max_abs_b);
+    const __int128 max_abs =
+        per_term * static_cast<__int128>(k);
+    out.required_dynamic_range = 2 * max_abs + 1;
+
+    const __int128 i64_max = static_cast<__int128>(std::numeric_limits<int64_t>::max());
+    if (per_term <= 0) {
+        out.max_k_for_num_moduli = std::numeric_limits<size_t>::max();
+    } else {
+        const __int128 max_k = i64_max / per_term;
+        out.max_k_for_num_moduli =
+            (max_k > static_cast<__int128>(std::numeric_limits<size_t>::max()))
+                ? std::numeric_limits<size_t>::max()
+                : static_cast<size_t>(max_k);
+    }
+
+    out.exact_guaranteed = (max_abs <= i64_max);
+    return out;
+}
+
 void write_oz2_time_row(
     std::ofstream &out,
     const double phi,
@@ -1085,27 +1396,20 @@ void write_oz2_time_row(
 int main(int argc, char **argv) {
     try {
         CliConfig cfg = parse_cli(argc, argv);
-
-        if (!cfg.moduli_explicit) {
-            size_t max_k_shape = 0;
-            for (const auto &[m, n, k] : cfg.shapes) {
-                (void)m;
-                (void)n;
-                max_k_shape = std::max(max_k_shape, k);
+        if (cfg.moduli_explicit) validate_moduli_list(cfg.moduli);
+        if (cfg.i32_scheme == I32SchemeMode::OZ1 && cfg.moduli_explicit) {
+            for (const unsigned mod : cfg.moduli) {
+                if (mod != 5u) {
+                    throw std::invalid_argument(
+                        "OZ1 requires num_moduli=5 (remove --moduli or set --moduli 5).");
+                }
             }
-            unsigned required = oz2::i32::required_num_moduli_for_bounds(
-                static_cast<uint64_t>(cfg.input_bound),
-                static_cast<uint64_t>(cfg.input_bound),
-                max_k_shape);
-            required = std::max(required, oz2::i32::kMinNumModuli);
-            if (required > oz2::i32::kMaxNumModuli) {
-                throw std::runtime_error(
-                    "auto-selected required_num_moduli exceeds supported range. reduce --input-bound or k.");
-            }
-            cfg.moduli = {required};
         }
-
-        validate_moduli_list(cfg.moduli);
+        if (cfg.i32_scheme == I32SchemeMode::OZ1 && cfg.tune_moduli) {
+            std::cerr << "[WARN] --tune-moduli is ignored for --i32-scheme oz1 (fixed num_moduli=5)\n";
+        }
+        const std::map<BaselineI32Key, BaselineI32Value> baseline_i32_rows =
+            load_baseline_i32_csv(cfg.baseline_i32_csv, cfg.baseline_i32_policy);
 
         const int iters = cfg.iters;
         const int warmup = cfg.warmup;
@@ -1128,7 +1432,7 @@ int main(int argc, char **argv) {
 
         std::ofstream out(file_i32);
         out << std::scientific;
-        out << "m,n,k,opA,opB,use_extra,num_moduli,iters,warmup,"
+        out << "m,n,k,opA,opB,i32_scheme,use_extra,num_moduli,iters,warmup,"
                "gemmul8_total_ms,gemmul8_encode_ms,gemmul8_tc_ms,gemmul8_conv32to8_ms,gemmul8_reconstruct_ms,"
                "gemmul8_gflops,"
                "gemmul8_max_abs_error,gemmul8_mismatch_count,gemmul8_exact_match,"
@@ -1159,6 +1463,9 @@ int main(int argc, char **argv) {
                   << " warmup=" << warmup
                   << " watt=" << (cfg.enable_watt ? "on" : "off")
                   << " aux_int8_baseline=" << (cfg.with_int8_baseline ? "on" : "off")
+                  << " i32_scheme=" << i32_scheme_mode_name(cfg.i32_scheme)
+                  << " baseline_i32_csv=" << (cfg.baseline_i32_csv.empty() ? "off" : cfg.baseline_i32_csv)
+                  << " baseline_i32_policy=" << baseline_i32_policy_name(cfg.baseline_i32_policy)
                   << " phi=" << cfg.phi
                   << " scale_exp=" << cfg.scale_exp
                   << " input_bound=" << cfg.input_bound
@@ -1170,9 +1477,19 @@ int main(int argc, char **argv) {
             std::cout << " " << m << "x" << n << "x" << k;
         }
         std::cout << '\n';
-        std::cout << "[INFO] moduli:";
-        for (const auto mod : cfg.moduli) {
-            std::cout << " " << mod;
+        std::cout << "[INFO] moduli=";
+        if (cfg.moduli_explicit) {
+            for (const auto mod : cfg.moduli) {
+                std::cout << " " << mod;
+            }
+            if (cfg.tune_moduli) {
+                std::cout << " (explicit sweep + tuned best pick)";
+            }
+        } else {
+            std::cout << " auto(required per shape/op)";
+            if (cfg.tune_moduli) {
+                std::cout << " + tune_window=" << cfg.moduli_tune_window;
+            }
         }
         std::cout << '\n';
         std::cout << "[INFO] ops:";
@@ -1182,6 +1499,7 @@ int main(int argc, char **argv) {
         std::cout << '\n';
         std::cout << "[INFO] csv=" << file_i32 << '\n';
         std::cout << "[INFO] fp64-style-time-csv=" << file_oz2_time << '\n';
+        std::cout << "[INFO] baseline_i32_rows_loaded=" << baseline_i32_rows.size() << '\n';
 
         std::mt19937 rng(123456u);
         auto safe_ratio = [](const double num, const double den) -> double {
@@ -1281,6 +1599,24 @@ int main(int argc, char **argv) {
                 const double exact_gflops = compute_gflops(ops, exact_i32_i32_i64_ms);
                 const double cublas_single_gflops = cfg.with_int8_baseline ? compute_gflops(ops, cublas_i8_single_ms) : 0.0;
 
+                double baseline_i32_ms = exact_i32_i32_i64_ms;
+                double baseline_i32_gflops = exact_gflops;
+                bool baseline_i32_from_csv = false;
+                if (!baseline_i32_rows.empty()) {
+                    BaselineI32Key bkey {};
+                    bkey.m = m;
+                    bkey.n = n;
+                    bkey.k = k;
+                    bkey.opA = op_to_char(op_A);
+                    bkey.opB = op_to_char(op_B);
+                    const auto it_base = baseline_i32_rows.find(bkey);
+                    if (it_base != baseline_i32_rows.end()) {
+                        baseline_i32_ms = it_base->second.time_ms;
+                        baseline_i32_gflops = it_base->second.gflops;
+                        baseline_i32_from_csv = true;
+                    }
+                }
+
                 const std::vector<double> exact_watt_res = cfg.enable_watt
                                                                ? bench_exact_i32_i32_i64_watt(
                                                                      op_A, op_B, m, n, k,
@@ -1312,164 +1648,398 @@ int main(int argc, char **argv) {
                     baseline_breakdown,
                     exact_gflops);
 
-                for (const unsigned num_moduli : cfg.moduli) {
-                    const PrecisionReport pr = evaluate_precision(max_abs_a, max_abs_b, k, num_moduli);
+                const bool run_oz2 = (cfg.i32_scheme == I32SchemeMode::OZ2 || cfg.i32_scheme == I32SchemeMode::BOTH);
+                const bool run_oz1 = (cfg.i32_scheme == I32SchemeMode::OZ1 || cfg.i32_scheme == I32SchemeMode::BOTH);
+                std::map<unsigned, std::vector<double>> cublas_x_moduli_watt_cache;
+                auto dump_row = [&](const gemmul8::I32Scheme scheme,
+                                    const bool use_extra,
+                                    const unsigned num_moduli,
+                                    const PrecisionReport &pr,
+                                    const I32BenchBreakdown &b,
+                                    const AccuracyStats &acc,
+                                    const std::vector<double> &watt_res,
+                                    const std::string &func_label) {
+                    const double cublas_i8_x_moduli_ms = cfg.with_int8_baseline
+                                                             ? (cublas_i8_single_ms * static_cast<double>(num_moduli))
+                                                             : 0.0;
+                    const double cublas_x_moduli_gflops = cfg.with_int8_baseline
+                                                              ? compute_gflops(
+                                                                    ops * static_cast<double>(num_moduli),
+                                                                    cublas_i8_x_moduli_ms)
+                                                              : 0.0;
+                    const std::vector<double> *cublas_x_moduli_watt_res = nullptr;
+                    if (cfg.enable_watt && cfg.with_int8_baseline) {
+                        auto it = cublas_x_moduli_watt_cache.find(num_moduli);
+                        if (it == cublas_x_moduli_watt_cache.end()) {
+                            it = cublas_x_moduli_watt_cache.emplace(
+                                num_moduli,
+                                bench_cublas_i8_watt(
+                                    handle,
+                                    op_A,
+                                    op_B,
+                                    m,
+                                    n,
+                                    k,
+                                    dA8,
+                                    lda,
+                                    dB8,
+                                    ldb,
+                                    dC32,
+                                    ldc,
+                                    num_moduli))
+                                     .first;
+                        }
+                        cublas_x_moduli_watt_res = &it->second;
+                    }
+                    const double cublas_x_moduli_watt = (cfg.enable_watt && cfg.with_int8_baseline)
+                                                            ? (*cublas_x_moduli_watt_res)[0]
+                                                            : 0.0;
+                    const double cublas_x_moduli_gflops_per_watt = (cfg.enable_watt && cfg.with_int8_baseline)
+                                                                        ? ((*cublas_x_moduli_watt_res)[1] * 1e-9)
+                                                                        : 0.0;
+
+                    const double speedup_exact = safe_ratio(exact_i32_i32_i64_ms, b.total_ms);
+                    const double speedup_baseline = safe_ratio(baseline_i32_ms, b.total_ms);
+                    const double speedup_single = cfg.with_int8_baseline ? safe_ratio(cublas_i8_single_ms, b.total_ms) : 0.0;
+                    const double speedup_x_moduli = cfg.with_int8_baseline ? safe_ratio(cublas_i8_x_moduli_ms, b.total_ms) : 0.0;
+                    const double gemmul8_gflops = compute_gflops(ops, b.total_ms);
+                    const double gemmul8_watt = cfg.enable_watt ? watt_res[0] : 0.0;
+                    const double gemmul8_gflops_per_watt = cfg.enable_watt ? (watt_res[1] * 1e-9) : 0.0;
+                    const StageRatio ratio = to_stage_ratio(b);
+
+                    out << m << ','
+                        << n << ','
+                        << k << ','
+                        << op_to_char(op_A) << ','
+                        << op_to_char(op_B) << ','
+                        << i32_scheme_tag(scheme) << ','
+                        << (use_extra ? 1 : 0) << ','
+                        << num_moduli << ','
+                        << iters << ','
+                        << warmup << ','
+                        << b.total_ms << ','
+                        << b.encode_ms << ','
+                        << b.tc_gemm_ms << ','
+                        << b.conv32to8_ms << ','
+                        << b.reconstruct_ms << ','
+                        << gemmul8_gflops << ','
+                        << acc.max_abs_error << ','
+                        << acc.mismatch_count << ','
+                        << (acc.exact_match ? 1 : 0) << ',';
+
+                    if (cfg.enable_watt) out << gemmul8_watt;
+                    out << ',';
+                    if (cfg.enable_watt) out << gemmul8_gflops_per_watt;
+                    out << ',';
+
+                    out << exact_i32_i32_i64_ms << ','
+                        << speedup_exact << ','
+                        << exact_gflops << ',';
+                    out << baseline_i32_ms << ','
+                        << baseline_i32_gflops << ','
+                        << speedup_baseline << ',';
+                    if (cfg.enable_watt) out << exact_watt;
+                    out << ',';
+                    if (cfg.enable_watt) out << exact_gflops_per_watt;
+                    out << ',';
+
+                    if (cfg.with_int8_baseline) {
+                        out << cublas_i8_single_ms << ','
+                            << cublas_i8_x_moduli_ms << ','
+                            << speedup_single << ','
+                            << speedup_x_moduli << ','
+                            << cublas_single_gflops << ','
+                            << cublas_x_moduli_gflops << ',';
+                        if (cfg.enable_watt) out << cublas_single_watt;
+                        out << ',';
+                        if (cfg.enable_watt) out << cublas_single_gflops_per_watt;
+                        out << ',';
+                        if (cfg.enable_watt) out << cublas_x_moduli_watt;
+                        out << ',';
+                        if (cfg.enable_watt) out << cublas_x_moduli_gflops_per_watt;
+                        out << ',';
+                    } else {
+                        out << ",,,,,,,,,,";
+                    }
+
+                    out << (cublas_int32_supported ? 1 : 0) << ','
+                        << static_cast<int>(int32_status) << ','
+                        << cfg.phi << ','
+                        << cfg.scale_exp << ','
+                        << cfg.input_bound << ','
+                        << max_abs_a << ','
+                        << max_abs_b << ','
+                        << pr.required_num_moduli << ','
+                        << pr.max_k_for_num_moduli << ','
+                        << (pr.exact_guaranteed ? 1 : 0) << ','
+                        << ratio.encode_pct << ','
+                        << ratio.tc_pct << ','
+                        << ratio.conv_pct << ','
+                        << ratio.reconstruct_pct << ','
+                        << cpu_mode_name(cfg.cpu_check_mode) << ','
+                        << cpu_check.checked << ','
+                        << cpu_check.mismatch_count << ','
+                        << cpu_check.max_abs_error
+                        << '\n';
+
+                    write_oz2_time_row(out_time, cfg.phi, m, n, k, func_label, acc, b, gemmul8_gflops);
+
+                    std::cout << "[BENCH] m=" << m << " n=" << n << " k=" << k
+                              << " op=" << op_pair_to_string(op_A, op_B)
+                              << " scheme=" << i32_scheme_tag(scheme)
+                              << " mod=" << num_moduli
+                              << " use_extra=" << (use_extra ? "true" : "false")
+                              << " exact_guaranteed=" << (pr.exact_guaranteed ? "yes" : "no")
+                              << " required_mod=" << pr.required_num_moduli
+                              << " max_k@mod=" << pr.max_k_for_num_moduli
+                              << " gemmul8_total_ms=" << b.total_ms
+                              << " stage_pct=(" << ratio.encode_pct << ","
+                              << ratio.tc_pct << ","
+                              << ratio.conv_pct << ","
+                              << ratio.reconstruct_pct << ")"
+                              << " gemmul8_gflops=" << gemmul8_gflops
+                              << " mismatch=" << acc.mismatch_count
+                              << " speedup(exact)=" << speedup_exact
+                              << " speedup(baseline_i32)=" << speedup_baseline
+                              << " baseline_src=" << (baseline_i32_from_csv ? "csv" : "exact_fallback");
+                    if (cfg.with_int8_baseline) {
+                        std::cout << " speedup(single)=" << speedup_single
+                                  << " speedup(xmoduli)=" << speedup_x_moduli;
+                    } else {
+                        std::cout << " speedup(single)=NA"
+                                  << " speedup(xmoduli)=NA";
+                    }
+                    if (cfg.enable_watt) {
+                        std::cout << " gemmul8_watt=" << gemmul8_watt
+                                  << " gemmul8_gflops_per_watt=" << gemmul8_gflops_per_watt;
+                    }
+                    std::cout << '\n';
+                };
+                if (run_oz2) {
+                    std::vector<unsigned> moduli_candidates = cfg.moduli_explicit
+                                                                  ? cfg.moduli
+                                                                  : make_auto_moduli_candidates(
+                                                                        max_abs_a,
+                                                                        max_abs_b,
+                                                                        k,
+                                                                        cfg.tune_moduli,
+                                                                        cfg.moduli_tune_window);
+                    std::sort(moduli_candidates.begin(), moduli_candidates.end());
+                    moduli_candidates.erase(std::unique(moduli_candidates.begin(), moduli_candidates.end()),
+                                           moduli_candidates.end());
+                    if (moduli_candidates.empty()) {
+                        throw std::runtime_error("no moduli candidates available");
+                    }
+                    validate_moduli_list(moduli_candidates);
+
+                    if (cfg.tune_moduli) {
+                        std::cout << "[TUNE] m=" << m
+                                  << " n=" << n
+                                  << " k=" << k
+                                  << " op=" << op_pair_to_string(op_A, op_B)
+                                  << " scheme=oz2"
+                                  << " candidates:";
+                        for (const unsigned mod : moduli_candidates) {
+                            std::cout << " " << mod;
+                        }
+                        std::cout << '\n';
+                    }
+
+                    struct BenchCandidate {
+                        bool use_extra = false;
+                        unsigned num_moduli = 0;
+                        PrecisionReport pr {};
+                        I32BenchBreakdown breakdown {};
+                        AccuracyStats acc {};
+                        std::vector<double> watt {};
+                        std::string func_label {};
+                    };
+
+                    std::vector<BenchCandidate> candidates;
+                    if (cfg.tune_moduli) {
+                        candidates.reserve(moduli_candidates.size() * 2u);
+                    }
+
+                    for (const unsigned num_moduli : moduli_candidates) {
+                        const PrecisionReport pr = evaluate_precision(max_abs_a, max_abs_b, k, num_moduli);
+
+                        const I32BenchBreakdown b_true = bench_gemmul8_i32_ms<true>(
+                            handle, gemmul8::I32Scheme::OZAKI2_CRT, op_A, op_B, m, n, k,
+                            dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
+                        const AccuracyStats acc_true = compare_i64_outputs(copy_i64_from_device(dC64, ldc * n), h_exact);
+                        const std::vector<double> gemmul8_watt_true = cfg.enable_watt
+                                                                           ? bench_gemmul8_i32_watt<true>(
+                                                                                 handle, gemmul8::I32Scheme::OZAKI2_CRT, op_A, op_B, m, n, k,
+                                                                                 dA, lda, dB, ldb, dC64, ldc, num_moduli)
+                                                                           : std::vector<double> {};
+
+                        const I32BenchBreakdown b_false = bench_gemmul8_i32_ms<false>(
+                            handle, gemmul8::I32Scheme::OZAKI2_CRT, op_A, op_B, m, n, k,
+                            dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
+                        const AccuracyStats acc_false = compare_i64_outputs(copy_i64_from_device(dC64, ldc * n), h_exact);
+                        const std::vector<double> gemmul8_watt_false = cfg.enable_watt
+                                                                            ? bench_gemmul8_i32_watt<false>(
+                                                                                  handle, gemmul8::I32Scheme::OZAKI2_CRT, op_A, op_B, m, n, k,
+                                                                                  dA, lda, dB, ldb, dC64, ldc, num_moduli)
+                                                                            : std::vector<double> {};
+
+                        if (cfg.tune_moduli) {
+                            candidates.push_back(BenchCandidate {
+                                true,
+                                num_moduli,
+                                pr,
+                                b_true,
+                                acc_true,
+                                std::move(gemmul8_watt_true),
+                                "I32-accu-" + std::to_string(num_moduli) + "-extra",
+                            });
+                            candidates.push_back(BenchCandidate {
+                                false,
+                                num_moduli,
+                                pr,
+                                b_false,
+                                acc_false,
+                                std::move(gemmul8_watt_false),
+                                "I32-accu-" + std::to_string(num_moduli) + "-compact",
+                            });
+                        } else {
+                            dump_row(
+                                gemmul8::I32Scheme::OZAKI2_CRT,
+                                true,
+                                num_moduli,
+                                pr,
+                                b_true,
+                                acc_true,
+                                gemmul8_watt_true,
+                                "I32-accu-" + std::to_string(num_moduli) + "-extra");
+                            dump_row(
+                                gemmul8::I32Scheme::OZAKI2_CRT,
+                                false,
+                                num_moduli,
+                                pr,
+                                b_false,
+                                acc_false,
+                                gemmul8_watt_false,
+                                "I32-accu-" + std::to_string(num_moduli) + "-compact");
+                        }
+                    }
+
+                    if (cfg.tune_moduli) {
+                        auto candidate_tier = [](const BenchCandidate &c) -> int {
+                            if (c.breakdown.total_ms <= 0.0) return 0;
+                            if (c.pr.exact_guaranteed && c.acc.exact_match) return 3;
+                            if (c.acc.exact_match) return 2;
+                            return 1;
+                        };
+                        auto better_candidate = [&](const BenchCandidate &lhs, const BenchCandidate &rhs) -> bool {
+                            const int lhs_tier = candidate_tier(lhs);
+                            const int rhs_tier = candidate_tier(rhs);
+                            if (lhs_tier != rhs_tier) return lhs_tier > rhs_tier;
+                            if (std::abs(lhs.breakdown.total_ms - rhs.breakdown.total_ms) > 1e-12) {
+                                return lhs.breakdown.total_ms < rhs.breakdown.total_ms;
+                            }
+                            return lhs.num_moduli < rhs.num_moduli;
+                        };
+
+                        auto choose_best = [&](const bool use_extra) -> const BenchCandidate * {
+                            const BenchCandidate *best = nullptr;
+                            for (const auto &cand : candidates) {
+                                if (cand.use_extra != use_extra) continue;
+                                if (best == nullptr || better_candidate(cand, *best)) {
+                                    best = &cand;
+                                }
+                            }
+                            return best;
+                        };
+
+                        const BenchCandidate *best_true = choose_best(true);
+                        const BenchCandidate *best_false = choose_best(false);
+                        if (best_true == nullptr || best_false == nullptr) {
+                            throw std::runtime_error("failed to select tuned moduli candidate");
+                        }
+
+                        auto log_selected = [&](const BenchCandidate &cand) {
+                            const int tier = candidate_tier(cand);
+                            std::cout << "[TUNE] m=" << m
+                                      << " n=" << n
+                                      << " k=" << k
+                                      << " op=" << op_pair_to_string(op_A, op_B)
+                                      << " scheme=oz2"
+                                      << " use_extra=" << (cand.use_extra ? "true" : "false")
+                                      << " selected_mod=" << cand.num_moduli
+                                      << " tier=" << tier
+                                      << " exact_guaranteed=" << (cand.pr.exact_guaranteed ? "yes" : "no")
+                                      << " exact_match=" << (cand.acc.exact_match ? "yes" : "no")
+                                      << " total_ms=" << cand.breakdown.total_ms
+                                      << '\n';
+                        };
+
+                        log_selected(*best_true);
+                        log_selected(*best_false);
+
+                        dump_row(
+                            gemmul8::I32Scheme::OZAKI2_CRT,
+                            best_true->use_extra,
+                            best_true->num_moduli,
+                            best_true->pr,
+                            best_true->breakdown,
+                            best_true->acc,
+                            best_true->watt,
+                            best_true->func_label);
+                        dump_row(
+                            gemmul8::I32Scheme::OZAKI2_CRT,
+                            best_false->use_extra,
+                            best_false->num_moduli,
+                            best_false->pr,
+                            best_false->breakdown,
+                            best_false->acc,
+                            best_false->watt,
+                            best_false->func_label);
+                    }
+                }
+
+                if (run_oz1) {
+                    constexpr unsigned num_moduli = 5u;
+                    const PrecisionReport pr = evaluate_precision_oz1(max_abs_a, max_abs_b, k);
 
                     const I32BenchBreakdown b_true = bench_gemmul8_i32_ms<true>(
-                        handle, op_A, op_B, m, n, k, dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
+                        handle, gemmul8::I32Scheme::OZAKI1_SPLIT, op_A, op_B, m, n, k,
+                        dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
                     const AccuracyStats acc_true = compare_i64_outputs(copy_i64_from_device(dC64, ldc * n), h_exact);
                     const std::vector<double> gemmul8_watt_true = cfg.enable_watt
                                                                        ? bench_gemmul8_i32_watt<true>(
-                                                                             handle, op_A, op_B, m, n, k,
+                                                                             handle, gemmul8::I32Scheme::OZAKI1_SPLIT, op_A, op_B, m, n, k,
                                                                              dA, lda, dB, ldb, dC64, ldc, num_moduli)
-                                                                       : std::vector<double>{};
+                                                                       : std::vector<double> {};
 
                     const I32BenchBreakdown b_false = bench_gemmul8_i32_ms<false>(
-                        handle, op_A, op_B, m, n, k, dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
+                        handle, gemmul8::I32Scheme::OZAKI1_SPLIT, op_A, op_B, m, n, k,
+                        dA, lda, dB, ldb, dC64, ldc, num_moduli, warmup, iters);
                     const AccuracyStats acc_false = compare_i64_outputs(copy_i64_from_device(dC64, ldc * n), h_exact);
                     const std::vector<double> gemmul8_watt_false = cfg.enable_watt
                                                                         ? bench_gemmul8_i32_watt<false>(
-                                                                              handle, op_A, op_B, m, n, k,
+                                                                              handle, gemmul8::I32Scheme::OZAKI1_SPLIT, op_A, op_B, m, n, k,
                                                                               dA, lda, dB, ldb, dC64, ldc, num_moduli)
-                                                                        : std::vector<double>{};
+                                                                        : std::vector<double> {};
 
-                    const double cublas_i8_x_moduli_ms = cfg.with_int8_baseline
-                                                              ? (cublas_i8_single_ms * static_cast<double>(num_moduli))
-                                                              : 0.0;
-                    const double cublas_x_moduli_gflops = cfg.with_int8_baseline
-                                                               ? compute_gflops(ops * static_cast<double>(num_moduli), cublas_i8_x_moduli_ms)
-                                                               : 0.0;
-                    const std::vector<double> cublas_x_moduli_watt_res = (cfg.enable_watt && cfg.with_int8_baseline)
-                                                                              ? bench_cublas_i8_watt(
-                                                                                    handle, op_A, op_B, m, n, k,
-                                                                                    dA8, lda, dB8, ldb, dC32, ldc, num_moduli)
-                                                                              : std::vector<double>{};
-                    const double cublas_x_moduli_watt = (cfg.enable_watt && cfg.with_int8_baseline) ? cublas_x_moduli_watt_res[0] : 0.0;
-                    const double cublas_x_moduli_gflops_per_watt = (cfg.enable_watt && cfg.with_int8_baseline) ? (cublas_x_moduli_watt_res[1] * 1e-9) : 0.0;
-
-                    auto dump_row = [&](const bool use_extra,
-                                        const I32BenchBreakdown &b,
-                                        const AccuracyStats &acc,
-                                        const std::vector<double> &watt_res,
-                                        const std::string &func_label) {
-                        const double speedup_exact = safe_ratio(exact_i32_i32_i64_ms, b.total_ms);
-                        const double speedup_baseline = speedup_exact;
-                        const double speedup_single = cfg.with_int8_baseline ? safe_ratio(cublas_i8_single_ms, b.total_ms) : 0.0;
-                        const double speedup_x_moduli = cfg.with_int8_baseline ? safe_ratio(cublas_i8_x_moduli_ms, b.total_ms) : 0.0;
-                        const double gemmul8_gflops = compute_gflops(ops, b.total_ms);
-                        const double gemmul8_watt = cfg.enable_watt ? watt_res[0] : 0.0;
-                        const double gemmul8_gflops_per_watt = cfg.enable_watt ? (watt_res[1] * 1e-9) : 0.0;
-                        const StageRatio ratio = to_stage_ratio(b);
-
-                        out << m << ','
-                            << n << ','
-                            << k << ','
-                            << op_to_char(op_A) << ','
-                            << op_to_char(op_B) << ','
-                            << (use_extra ? 1 : 0) << ','
-                            << num_moduli << ','
-                            << iters << ','
-                            << warmup << ','
-                            << b.total_ms << ','
-                            << b.encode_ms << ','
-                            << b.tc_gemm_ms << ','
-                            << b.conv32to8_ms << ','
-                            << b.reconstruct_ms << ','
-                            << gemmul8_gflops << ','
-                            << acc.max_abs_error << ','
-                            << acc.mismatch_count << ','
-                            << (acc.exact_match ? 1 : 0) << ',';
-
-                        if (cfg.enable_watt) out << gemmul8_watt;
-                        out << ',';
-                        if (cfg.enable_watt) out << gemmul8_gflops_per_watt;
-                        out << ',';
-
-                        out << exact_i32_i32_i64_ms << ','
-                            << speedup_exact << ','
-                            << exact_gflops << ',';
-                        out << exact_i32_i32_i64_ms << ','
-                            << exact_gflops << ','
-                            << speedup_baseline << ',';
-                        if (cfg.enable_watt) out << exact_watt;
-                        out << ',';
-                        if (cfg.enable_watt) out << exact_gflops_per_watt;
-                        out << ',';
-
-                        if (cfg.with_int8_baseline) {
-                            out << cublas_i8_single_ms << ','
-                                << cublas_i8_x_moduli_ms << ','
-                                << speedup_single << ','
-                                << speedup_x_moduli << ','
-                                << cublas_single_gflops << ','
-                                << cublas_x_moduli_gflops << ',';
-                            if (cfg.enable_watt) out << cublas_single_watt;
-                            out << ',';
-                            if (cfg.enable_watt) out << cublas_single_gflops_per_watt;
-                            out << ',';
-                            if (cfg.enable_watt) out << cublas_x_moduli_watt;
-                            out << ',';
-                            if (cfg.enable_watt) out << cublas_x_moduli_gflops_per_watt;
-                            out << ',';
-                        } else {
-                            out << ",,,,,,,,,,";
-                        }
-
-                        out << (cublas_int32_supported ? 1 : 0) << ','
-                            << static_cast<int>(int32_status) << ','
-                            << cfg.phi << ','
-                            << cfg.scale_exp << ','
-                            << cfg.input_bound << ','
-                            << max_abs_a << ','
-                            << max_abs_b << ','
-                            << pr.required_num_moduli << ','
-                            << pr.max_k_for_num_moduli << ','
-                            << (pr.exact_guaranteed ? 1 : 0) << ','
-                            << ratio.encode_pct << ','
-                            << ratio.tc_pct << ','
-                            << ratio.conv_pct << ','
-                            << ratio.reconstruct_pct << ','
-                            << cpu_mode_name(cfg.cpu_check_mode) << ','
-                            << cpu_check.checked << ','
-                            << cpu_check.mismatch_count << ','
-                            << cpu_check.max_abs_error
-                            << '\n';
-
-                        write_oz2_time_row(out_time, cfg.phi, m, n, k, func_label, acc, b, gemmul8_gflops);
-
-                        std::cout << "[BENCH] m=" << m << " n=" << n << " k=" << k
-                                  << " op=" << op_pair_to_string(op_A, op_B)
-                                  << " mod=" << num_moduli
-                                  << " use_extra=" << (use_extra ? "true" : "false")
-                                  << " exact_guaranteed=" << (pr.exact_guaranteed ? "yes" : "no")
-                                  << " required_mod=" << pr.required_num_moduli
-                                  << " max_k@mod=" << pr.max_k_for_num_moduli
-                                  << " gemmul8_total_ms=" << b.total_ms
-                                  << " stage_pct=(" << ratio.encode_pct << ","
-                                  << ratio.tc_pct << ","
-                                  << ratio.conv_pct << ","
-                                  << ratio.reconstruct_pct << ")"
-                                  << " gemmul8_gflops=" << gemmul8_gflops
-                                  << " mismatch=" << acc.mismatch_count
-                                  << " speedup(exact)=" << speedup_exact;
-                        if (cfg.with_int8_baseline) {
-                            std::cout << " speedup(single)=" << speedup_single
-                                      << " speedup(xmoduli)=" << speedup_x_moduli;
-                        } else {
-                            std::cout << " speedup(single)=NA"
-                                      << " speedup(xmoduli)=NA";
-                        }
-                        if (cfg.enable_watt) {
-                            std::cout << " gemmul8_watt=" << gemmul8_watt
-                                      << " gemmul8_gflops_per_watt=" << gemmul8_gflops_per_watt;
-                        }
-                        std::cout << '\n';
-                    };
-
-                    dump_row(true, b_true, acc_true, gemmul8_watt_true,
-                             "I32-accu-" + std::to_string(num_moduli) + "-extra");
-                    dump_row(false, b_false, acc_false, gemmul8_watt_false,
-                             "I32-accu-" + std::to_string(num_moduli) + "-compact");
+                    dump_row(
+                        gemmul8::I32Scheme::OZAKI1_SPLIT,
+                        true,
+                        num_moduli,
+                        pr,
+                        b_true,
+                        acc_true,
+                        gemmul8_watt_true,
+                        "I32-os1-5-extra");
+                    dump_row(
+                        gemmul8::I32Scheme::OZAKI1_SPLIT,
+                        false,
+                        num_moduli,
+                        pr,
+                        b_false,
+                        acc_false,
+                        gemmul8_watt_false,
+                        "I32-os1-5-compact");
                 }
 
                 cudaFree(dA);

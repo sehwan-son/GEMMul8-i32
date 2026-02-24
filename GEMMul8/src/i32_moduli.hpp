@@ -10,9 +10,12 @@
 namespace oz2 {
 namespace i32 {
 
-inline constexpr unsigned kMinNumModuli = 9u;
+inline constexpr unsigned kMinNumModuli = 5u;
 inline constexpr unsigned kMaxNumModuli = 20u;
 inline constexpr size_t kMaxK           = (1u << 17u);
+
+constexpr __int128 kInt128Max =
+    static_cast<__int128>((static_cast<unsigned __int128>(1u) << 127u) - 1u);
 
 inline constexpr std::array<int32_t, kMaxNumModuli> kModuli = {
     256, 255, 253, 251, 247, 241, 239, 233, 229, 227,
@@ -61,7 +64,9 @@ __host__ __device__ __forceinline__ int8_t mod_centered_i8(const int64_t in, con
 constexpr __int128 prefix_product(const unsigned num_moduli) {
     __int128 out = 1;
     for (unsigned i = 0; i < num_moduli && i < kMaxNumModuli; ++i) {
-        out *= static_cast<__int128>(kModuli[i]);
+        const __int128 mod = static_cast<__int128>(kModuli[i]);
+        if (out > kInt128Max / mod) return kInt128Max;
+        out *= mod;
     }
     return out;
 }
@@ -69,10 +74,13 @@ constexpr __int128 prefix_product(const unsigned num_moduli) {
 constexpr unsigned required_num_moduli_for_bounds(const uint64_t max_abs_a, const uint64_t max_abs_b, const size_t k) {
     if (max_abs_a == 0u || max_abs_b == 0u || k == 0u) return 1u;
     const __int128 max_abs = static_cast<__int128>(max_abs_a) * static_cast<__int128>(max_abs_b) * static_cast<__int128>(k);
+    if (max_abs > (kInt128Max - 1) / 2) return kMaxNumModuli + 1u;
     const __int128 need    = max_abs * 2 + 1;
     __int128 p             = 1;
     for (unsigned i = 0; i < kMaxNumModuli; ++i) {
-        p *= static_cast<__int128>(kModuli[i]);
+        const __int128 mod = static_cast<__int128>(kModuli[i]);
+        if (p > kInt128Max / mod) return i + 1u;
+        p *= mod;
         if (p >= need) return i + 1u;
     }
     return kMaxNumModuli + 1u;

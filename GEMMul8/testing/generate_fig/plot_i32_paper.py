@@ -87,13 +87,24 @@ def _parse_num_moduli_filter(text: str) -> Optional[int]:
     return int(text)
 
 
+def _parse_i32_scheme_filter(text: str) -> Optional[str]:
+    if text == "all":
+        return None
+    lowered = text.lower()
+    if lowered not in ("oz2", "oz1"):
+        raise ValueError(f"invalid --i32-scheme: {text}")
+    return lowered
+
+
 def _read_rows(
     csv_path: str,
     op_filter: str,
     use_extra_filter: str,
     num_moduli_filter: str,
+    i32_scheme_filter: str,
 ) -> List[Dict[str, object]]:
     mod_filter = _parse_num_moduli_filter(num_moduli_filter)
+    scheme_filter = _parse_i32_scheme_filter(i32_scheme_filter)
     rows: List[Dict[str, object]] = []
 
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -101,6 +112,9 @@ def _read_rows(
         for row in reader:
             op_pair = f"{row['opA']}{row['opB']}"
             use_extra = _to_bool_text(row["use_extra"])
+            scheme = (row.get("i32_scheme", "oz2") or "oz2").strip().lower()
+            if scheme not in ("oz2", "oz1"):
+                scheme = "oz2"
             moduli = _as_int(row, "num_moduli")
             n = _as_int(row, "n")
             m = _as_int(row, "m")
@@ -112,12 +126,15 @@ def _read_rows(
                 continue
             if use_extra_filter != "all" and use_extra != use_extra_filter:
                 continue
+            if scheme_filter is not None and scheme != scheme_filter:
+                continue
             if mod_filter is not None and moduli != mod_filter:
                 continue
 
             rec: Dict[str, object] = dict(row)
             rec["_op"] = op_pair
             rec["_use_extra"] = use_extra
+            rec["_scheme"] = scheme
             rec["_mod"] = moduli
             rec["_n"] = n
             rec["_m"] = m
@@ -568,6 +585,7 @@ def _write_summary(rows: Sequence[Dict[str, object]], validation: Dict[str, floa
         f"speedup_mean={sum(speedups)/len(speedups):.6f}",
         f"speedup_max={max(speedups):.6f}",
         f"best_speedup_cfg=op={best['_op']},use_extra={best['_use_extra']},n={best['_n']},value={(_as_float(best, SPEEDUP_KEY) or 0.0):.6f}",
+        f"best_speedup_scheme={best['_scheme']}",
         f"gpu_exact_match={gpu_exact}/{total_cfg}",
         f"cpu_sample_exact_match={cpu_exact}/{total_cfg}",
         f"required_moduli_min={min(req_vals):.2f}",
@@ -584,6 +602,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate publication-style i32 benchmark plots.")
     parser.add_argument("csv", help="Path to i32_bench_speedup_*.csv")
     parser.add_argument("--op", default="all", choices=["all", "NN", "NT", "TN", "TT"])
+    parser.add_argument("--i32-scheme", default="all", choices=["all", "oz2", "oz1"])
     parser.add_argument("--use-extra", default="all", choices=["all", "true", "false"])
     parser.add_argument("--num-moduli", default="all")
     parser.add_argument(
@@ -613,7 +632,7 @@ def main() -> int:
         return 1
 
     try:
-        rows = _read_rows(str(csv_path), args.op, args.use_extra, args.num_moduli)
+        rows = _read_rows(str(csv_path), args.op, args.use_extra, args.num_moduli, args.i32_scheme)
     except (ValueError, FileNotFoundError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

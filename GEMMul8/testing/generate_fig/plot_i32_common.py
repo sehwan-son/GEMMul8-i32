@@ -7,6 +7,7 @@ import csv
 import html
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +27,15 @@ def parse_num_moduli_filter(text: str) -> Optional[int]:
     if text == "all":
         return None
     return int(text)
+
+
+def parse_i32_scheme_filter(text: str) -> Optional[str]:
+    if text == "all":
+        return None
+    lowered = text.lower()
+    if lowered not in ("oz2", "oz1"):
+        raise ValueError(f"Invalid --i32-scheme value: {text}")
+    return lowered
 
 
 def metric_value(row: Dict[str, str], key: str) -> Optional[float]:
@@ -50,28 +60,66 @@ def read_filtered_rows(
     op: str = "all",
     use_extra: str = "all",
     num_moduli: str = "all",
+    i32_scheme: str = "all",
     x_axis: str = "n",
 ) -> List[Dict[str, object]]:
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
     mod_filter = parse_num_moduli_filter(num_moduli)
+    scheme_filter = parse_i32_scheme_filter(i32_scheme)
     out: List[Dict[str, object]] = []
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
+        fieldnames = set(reader.fieldnames or [])
+        is_speedup_csv = {"opA", "opB", "use_extra", "num_moduli"}.issubset(fieldnames)
+        is_oz2_time_csv = {"function", "quantization", "low_prec_gemm", "dequantization"}.issubset(fieldnames)
+
+        if not (is_speedup_csv or is_oz2_time_csv):
+            raise ValueError(
+                f"Unsupported CSV format for i32 plotting: {csv_path} "
+                "(expected i32_bench_speedup_* or oz2_results_i32_time_*)"
+            )
+
         for row in reader:
-            op_pair = f"{row['opA']}{row['opB']}"
-            use_extra_text = to_bool_text(row["use_extra"])
-            mod = int(float(row["num_moduli"]))
-            m = int(float(row["m"]))
-            n = int(float(row["n"]))
-            k = int(float(row["k"]))
+            if is_speedup_csv:
+                try:
+                    op_pair = f"{row['opA']}{row['opB']}"
+                    use_extra_text = to_bool_text(row["use_extra"])
+                    mod = int(float(row["num_moduli"]))
+                    m = int(float(row["m"]))
+                    n = int(float(row["n"]))
+                    k = int(float(row["k"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                scheme = (row.get("i32_scheme", "oz2") or "oz2").strip().lower()
+                if scheme not in ("oz2", "oz1"):
+                    scheme = "oz2"
+            else:
+                fn = (row.get("function", "") or "").strip()
+                m_fun = re.match(r"^I32-(accu|os1|oz1)-(\d+)-(extra|compact)$", fn, flags=re.IGNORECASE)
+                if not m_fun:
+                    continue
+                family = m_fun.group(1).lower()
+                scheme = "oz2" if family == "accu" else "oz1"
+                mod = int(m_fun.group(2))
+                use_extra_text = "true" if m_fun.group(3).lower() == "extra" else "false"
+                op_pair = "NN"
+
+                try:
+                    m = int(float(row["m"]))
+                    n = int(float(row["n"]))
+                    k = int(float(row["k"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
 
             if op != "all" and op_pair != op:
                 continue
             if use_extra != "all" and use_extra_text != use_extra:
                 continue
             if mod_filter is not None and mod != mod_filter:
+                continue
+            if scheme_filter is not None and scheme != scheme_filter:
                 continue
 
             if x_axis == "n":
@@ -86,15 +134,36 @@ def read_filtered_rows(
                 raise ValueError(f"Invalid x_axis: {x_axis}")
 
             rec: Dict[str, object] = dict(row)
+            if is_oz2_time_csv:
+                q = metric_value(row, "quantization") or 0.0
+                g = metric_value(row, "low_prec_gemm") or 0.0
+                rq = metric_value(row, "requantization") or 0.0
+                dq = metric_value(row, "dequantization") or 0.0
+                total_sec = metric_value(row, "total_time[sec]")
+                total_ms = (total_sec * 1.0e3) if total_sec is not None else ((q + g + rq + dq) * 1.0e3)
+
+                # Normalize oz2_results_i32_time_* columns to i32_bench_speedup_* keys.
+                rec["opA"] = op_pair[0]
+                rec["opB"] = op_pair[1]
+                rec["use_extra"] = "1" if use_extra_text == "true" else "0"
+                rec["num_moduli"] = str(mod)
+                rec["i32_scheme"] = scheme
+                rec["gemmul8_total_ms"] = total_ms
+                rec["gemmul8_encode_ms"] = q * 1.0e3
+                rec["gemmul8_tc_ms"] = g * 1.0e3
+                rec["gemmul8_conv32to8_ms"] = rq * 1.0e3
+                rec["gemmul8_reconstruct_ms"] = dq * 1.0e3
+
             rec["_op_pair"] = op_pair
             rec["_use_extra"] = use_extra_text
             rec["_mod"] = mod
             rec["_m"] = m
             rec["_n"] = n
             rec["_k"] = k
+            rec["_scheme"] = scheme
             rec["_shape"] = f"{m}x{n}x{k}"
             rec["_x"] = int(x_value)
-            rec["_config"] = f"op={op_pair}, mod={mod}, use_extra={use_extra_text}"
+            rec["_config"] = f"scheme={scheme}, op={op_pair}, mod={mod}, use_extra={use_extra_text}"
             out.append(rec)
     return out
 

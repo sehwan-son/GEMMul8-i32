@@ -20,6 +20,13 @@ namespace gemmul8 {
 enum class Backend { INT8,
                      FP8 };
 
+#if defined(__NVCC__)
+enum class I32Scheme {
+    OZAKI2_CRT,
+    OZAKI1_SPLIT,
+};
+#endif
+
 /***
  * workSize returns the required workspace size in bytes.
  */
@@ -39,7 +46,7 @@ size_t workSize(
 /***
  * workSize_i32 returns the required workspace size in bytes for INT32 input path.
  * Preconditions:
- * - 9 <= num_moduli <= 20
+ * - 5 <= num_moduli <= 20
  * - k <= 2^17
  */
 template <bool UseExtraWorkspace = true>
@@ -47,9 +54,10 @@ size_t workSize_i32(
     size_t m,                         // Number of rows of C
     size_t n,                         // Number of columns of C
     size_t k,                         // Inner dimension <= 2^17
-    unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
+    unsigned num_moduli,              // #moduli, 5 <= num_moduli <= 20
     size_t *workSizeA      = nullptr, // [optional] Output: workspace size used for A8i
-    size_t *workSizeB      = nullptr  // [optional] Output: workspace size used for B8i
+    size_t *workSizeB      = nullptr, // [optional] Output: workspace size used for B8i
+    I32Scheme scheme       = I32Scheme::OZAKI2_CRT
 );
 
 /***
@@ -73,10 +81,11 @@ std::vector<double> gemm_i32(
     const int64_t *beta,              // Scaling factor for C
     int64_t *const C,                 // 1-D device array of dimensions ldc*n
     size_t ldc,                       // Leading dimension of C
-    unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
+    unsigned num_moduli,              // #moduli, 5 <= num_moduli <= 20
     void *const work,                 // Preallocated workspace
     void *const workA      = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
-    void *const workB      = nullptr  // [optional] Separate workspace for B (if nullptr, uses work)
+    void *const workB      = nullptr, // [optional] Separate workspace for B (if nullptr, uses work)
+    I32Scheme scheme       = I32Scheme::OZAKI2_CRT
 );
 
 /***
@@ -96,10 +105,11 @@ std::vector<double> gemm_i32(
     size_t ldb,                       // Leading dimension of B
     int64_t *const C,                 // 1-D device array of dimensions ldc*n
     size_t ldc,                       // Leading dimension of C
-    unsigned num_moduli,              // #moduli, 9 <= num_moduli <= 20
+    unsigned num_moduli,              // #moduli, 5 <= num_moduli <= 20
     void *const work,                 // Preallocated workspace
     void *const workA      = nullptr, // [optional] Separate workspace for A (if nullptr, uses work)
-    void *const workB      = nullptr  // [optional] Separate workspace for B (if nullptr, uses work)
+    void *const workB      = nullptr, // [optional] Separate workspace for B (if nullptr, uses work)
+    I32Scheme scheme       = I32Scheme::OZAKI2_CRT
 );
 #endif
 

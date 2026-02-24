@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,14 @@ struct CaseData {
 void check_cuda(cudaError_t status, const char *msg) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
+
+const char *scheme_name(const gemmul8::I32Scheme scheme) {
+    switch (scheme) {
+    case gemmul8::I32Scheme::OZAKI1_SPLIT: return "oz1";
+    case gemmul8::I32Scheme::OZAKI2_CRT:
+    default: return "oz2";
     }
 }
 
@@ -186,7 +195,8 @@ template <bool UseExtraWorkspace>
 RunStats run_case(
     cublasHandle_t handle,
     const CaseData &data,
-    const unsigned num_moduli //
+    const unsigned num_moduli,
+    const gemmul8::I32Scheme scheme //
 ) {
     std::vector<int64_t> hC(data.ldc * data.n, 0);
 
@@ -199,7 +209,7 @@ RunStats run_case(
     check_cuda(cudaMalloc(&dB, sizeof(int32_t) * data.hB.size()), "cudaMalloc dB");
     check_cuda(cudaMalloc(&dC, sizeof(int64_t) * hC.size()), "cudaMalloc dC");
 
-    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(data.m, data.n, data.k, num_moduli);
+    const size_t work_size = gemmul8::workSize_i32<UseExtraWorkspace>(data.m, data.n, data.k, num_moduli, nullptr, nullptr, scheme);
     check_cuda(cudaMalloc(&work, work_size), "cudaMalloc work");
 
     check_cuda(cudaMemcpy(dA, data.hA.data(), sizeof(int32_t) * data.hA.size(), cudaMemcpyHostToDevice), "cudaMemcpy A");
@@ -216,7 +226,10 @@ RunStats run_case(
         &data.beta,
         dC, data.ldc,
         num_moduli,
-        work);
+        work,
+        nullptr,
+        nullptr,
+        scheme);
     const double gemmul8_ms = (t_ns[0] + t_ns[1] + t_ns[2] + t_ns[3]) * 1.0e-6;
 
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
@@ -227,6 +240,7 @@ RunStats run_case(
             const size_t col = i / data.ldc;
             const size_t row = i - col * data.ldc;
             std::cerr << "[FAIL] mismatch"
+                      << " scheme=" << scheme_name(scheme)
                       << " use_extra=" << (UseExtraWorkspace ? "true" : "false")
                       << " opA=" << ((data.op_A == CUBLAS_OP_N) ? "N" : "T")
                       << " opB=" << ((data.op_B == CUBLAS_OP_N) ? "N" : "T")
@@ -267,10 +281,10 @@ void run_invalid_num_moduli_case(cublasHandle_t handle) {
     check_cuda(cudaMalloc(&dB, sizeof(int32_t) * k * n), "cudaMalloc invalid dB");
     check_cuda(cudaMalloc(&dC, sizeof(int64_t) * m * n), "cudaMalloc invalid dC");
 
-    const size_t work_size = gemmul8::workSize_i32<true>(m, n, k, 9u);
+    const size_t work_size = gemmul8::workSize_i32<true>(m, n, k, 5u);
     check_cuda(cudaMalloc(&work, work_size), "cudaMalloc invalid work");
 
-    bool threw = false;
+    bool threw_oz2 = false;
     try {
         constexpr int64_t alpha = 1;
         constexpr int64_t beta  = 0;
@@ -283,10 +297,35 @@ void run_invalid_num_moduli_case(cublasHandle_t handle) {
             dB, k,
             &beta,
             dC, m,
-            8u,
-            work);
+            4u,
+            work,
+            nullptr,
+            nullptr,
+            gemmul8::I32Scheme::OZAKI2_CRT);
     } catch (const std::invalid_argument &) {
-        threw = true;
+        threw_oz2 = true;
+    }
+
+    bool threw_oz1 = false;
+    try {
+        constexpr int64_t alpha = 1;
+        constexpr int64_t beta  = 0;
+        gemmul8::gemm_i32<true>(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            m, n, k,
+            &alpha,
+            dA, m,
+            dB, k,
+            &beta,
+            dC, m,
+            6u,
+            work,
+            nullptr,
+            nullptr,
+            gemmul8::I32Scheme::OZAKI1_SPLIT);
+    } catch (const std::invalid_argument &) {
+        threw_oz1 = true;
     }
 
     cudaFree(work);
@@ -294,9 +333,48 @@ void run_invalid_num_moduli_case(cublasHandle_t handle) {
     cudaFree(dB);
     cudaFree(dC);
 
-    if (!threw) {
-        throw std::runtime_error("gemm_i32 must throw on num_moduli=8.");
+    if (!threw_oz2) throw std::runtime_error("gemm_i32(oz2) must throw on num_moduli=4.");
+    if (!threw_oz1) throw std::runtime_error("gemm_i32(oz1) must throw on num_moduli!=5.");
+}
+
+CaseData prepare_extreme_case() {
+    CaseData out;
+    out.op_A = CUBLAS_OP_N;
+    out.op_B = CUBLAS_OP_N;
+    out.m = 8;
+    out.n = 8;
+    out.k = 8;
+    out.lda = out.m;
+    out.ldb = out.k;
+    out.ldc = out.m;
+    out.alpha = 1;
+    out.beta = 0;
+
+    out.hA.resize(out.lda * out.k);
+    out.hB.resize(out.ldb * out.n);
+    out.hC_init.resize(out.ldc * out.n, 0);
+    out.hRef.resize(out.ldc * out.n, 0);
+
+    for (size_t col = 0; col < out.k; ++col) {
+        for (size_t row = 0; row < out.m; ++row) {
+            out.hA[col * out.lda + row] = ((row + col) & 1u) ? std::numeric_limits<int32_t>::min() : std::numeric_limits<int32_t>::max();
+        }
     }
+    for (size_t col = 0; col < out.n; ++col) {
+        for (size_t row = 0; row < out.k; ++row) {
+            const int pat = static_cast<int>((row + 2 * col) % 3u);
+            out.hB[col * out.ldb + row] = (pat == 0) ? -1 : ((pat == 1) ? 0 : 1);
+        }
+    }
+
+    cpu_gemm_ref(
+        out.hA, out.hB,
+        out.op_A, out.op_B,
+        out.m, out.n, out.k,
+        out.lda, out.ldb, out.ldc,
+        out.alpha, out.beta,
+        out.hC_init, out.hRef);
+    return out;
 }
 
 } // namespace
@@ -319,7 +397,11 @@ int main() {
             {CUBLAS_OP_N, CUBLAS_OP_T},
             {CUBLAS_OP_T, CUBLAS_OP_N},
         };
-        const std::vector<unsigned> moduli_list = {9u, 20u};
+        const std::vector<unsigned> moduli_list = {5u, 20u};
+        const std::vector<gemmul8::I32Scheme> schemes = {
+            gemmul8::I32Scheme::OZAKI2_CRT,
+            gemmul8::I32Scheme::OZAKI1_SPLIT,
+        };
         const std::vector<std::pair<int64_t, int64_t>> alpha_beta_list = {
             {1, 0},
             {2, 3},
@@ -330,36 +412,55 @@ int main() {
             for (const auto &[m, n, k] : shapes) {
                 for (const auto &[op_A, op_B] : ops) {
                     const CaseData case_data = prepare_case(op_A, op_B, m, n, k, rng, alpha, beta);
-                    for (const auto num_moduli : moduli_list) {
-                        const RunStats stats_true  = run_case<true>(handle, case_data, num_moduli);
-                        const RunStats stats_false = run_case<false>(handle, case_data, num_moduli);
-                        std::cout << "[PASS] "
-                                  << "m=" << m << " n=" << n << " k=" << k
-                                  << " opA=" << ((op_A == CUBLAS_OP_N) ? "N" : "T")
-                                  << " opB=" << ((op_B == CUBLAS_OP_N) ? "N" : "T")
-                                  << " alpha=" << alpha << " beta=" << beta
-                                  << " num_moduli=" << num_moduli
-                                  << " use_extra=true"
-                                  << " gemmul8_ms=" << stats_true.gemmul8_ms
-                                  << " gemmul8_gflops=" << stats_true.gemmul8_gflops
-                                  << " cpu_ref_ms=" << stats_true.cpu_ref_ms
-                                  << " cpu_ref_gflops=" << stats_true.cpu_ref_gflops
-                                  << std::endl;
-                        std::cout << "[PASS] "
-                                  << "m=" << m << " n=" << n << " k=" << k
-                                  << " opA=" << ((op_A == CUBLAS_OP_N) ? "N" : "T")
-                                  << " opB=" << ((op_B == CUBLAS_OP_N) ? "N" : "T")
-                                  << " alpha=" << alpha << " beta=" << beta
-                                  << " num_moduli=" << num_moduli
-                                  << " use_extra=false"
-                                  << " gemmul8_ms=" << stats_false.gemmul8_ms
-                                  << " gemmul8_gflops=" << stats_false.gemmul8_gflops
-                                  << " cpu_ref_ms=" << stats_false.cpu_ref_ms
-                                  << " cpu_ref_gflops=" << stats_false.cpu_ref_gflops
-                                  << std::endl;
+                    for (const auto scheme : schemes) {
+                        const std::vector<unsigned> scheme_moduli =
+                            (scheme == gemmul8::I32Scheme::OZAKI1_SPLIT) ? std::vector<unsigned> {5u} : moduli_list;
+                        for (const auto num_moduli : scheme_moduli) {
+                            const RunStats stats_true  = run_case<true>(handle, case_data, num_moduli, scheme);
+                            const RunStats stats_false = run_case<false>(handle, case_data, num_moduli, scheme);
+                            std::cout << "[PASS] "
+                                      << "scheme=" << scheme_name(scheme)
+                                      << " m=" << m << " n=" << n << " k=" << k
+                                      << " opA=" << ((op_A == CUBLAS_OP_N) ? "N" : "T")
+                                      << " opB=" << ((op_B == CUBLAS_OP_N) ? "N" : "T")
+                                      << " alpha=" << alpha << " beta=" << beta
+                                      << " num_moduli=" << num_moduli
+                                      << " use_extra=true"
+                                      << " gemmul8_ms=" << stats_true.gemmul8_ms
+                                      << " gemmul8_gflops=" << stats_true.gemmul8_gflops
+                                      << " cpu_ref_ms=" << stats_true.cpu_ref_ms
+                                      << " cpu_ref_gflops=" << stats_true.cpu_ref_gflops
+                                      << std::endl;
+                            std::cout << "[PASS] "
+                                      << "scheme=" << scheme_name(scheme)
+                                      << " m=" << m << " n=" << n << " k=" << k
+                                      << " opA=" << ((op_A == CUBLAS_OP_N) ? "N" : "T")
+                                      << " opB=" << ((op_B == CUBLAS_OP_N) ? "N" : "T")
+                                      << " alpha=" << alpha << " beta=" << beta
+                                      << " num_moduli=" << num_moduli
+                                      << " use_extra=false"
+                                      << " gemmul8_ms=" << stats_false.gemmul8_ms
+                                      << " gemmul8_gflops=" << stats_false.gemmul8_gflops
+                                      << " cpu_ref_ms=" << stats_false.cpu_ref_ms
+                                      << " cpu_ref_gflops=" << stats_false.cpu_ref_gflops
+                                      << std::endl;
+                        }
                     }
                 }
             }
+        }
+
+        const CaseData extreme_case = prepare_extreme_case();
+        for (const auto scheme : schemes) {
+            const RunStats ex_true = run_case<true>(handle, extreme_case, 5u, scheme);
+            const RunStats ex_false = run_case<false>(handle, extreme_case, 5u, scheme);
+            std::cout << "[PASS] extreme"
+                      << " scheme=" << scheme_name(scheme)
+                      << " use_extra=true"
+                      << " gemmul8_ms=" << ex_true.gemmul8_ms
+                      << " use_extra=false"
+                      << " gemmul8_ms=" << ex_false.gemmul8_ms
+                      << std::endl;
         }
 
         run_invalid_num_moduli_case(handle);
